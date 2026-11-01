@@ -1,0 +1,27 @@
+[project]
+name = "planbound"
+version = "0.1.0"
+description = "Prepared statements and sagas for MCP agent actions: bounded plans, exact previews, budget approval, rollback."
+requires-python = ">=3.13"
+dependencies = [
+    "mcp>=2.3.0",
+    "cryptography>=43",
+]
+
+[project.optional-dependencies]
+reader = ["anthropic>=0.40"]
+
+[project.scripts]
+planbound = "planbound.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:asyncio"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[build-system]
+requires = ["uv_build>=0.9.13,<0.10.0"]
+build-backend = "uv_build"

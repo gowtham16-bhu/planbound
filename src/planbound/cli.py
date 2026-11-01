@@ -1,0 +1,123 @@
+"""`planbound` command line: serve the gateway, run the signer, approve, recover, draft a manifest."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+import time
+from pathlib import Path
+
+from .approval import BudgetPolicy, PolicySigner, describe_request, generate_keys
+from .gateway import Gateway, GatewayConfig, build_server, make_reader
+from .manifest import Manifest, infer_effects
+from .runtime import Runtime
+from .store import Store
+from .upstream import MCPUpstreams
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(prog="planbound", description=__doc__)
+    p.add_argument("--config", default="planbound.config.json")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve", help="run the gateway as an MCP server on stdio")
+    k = sub.add_parser("keys", help="create the policy and human signing keys")
+    k.add_argument("--dir", default=".planbound/keys")
+    s = sub.add_parser("signer", help="run the tier-2 policy signer (separate process, holds the private keys)")
+    s.add_argument("--keys", default=".planbound/keys")
+    s.add_argument("--budget", type=float, required=True, help="rolling budget, e.g. 500000")
+    s.add_argument("--window-hours", type=float, default=24)
+    s.add_argument("--max-plan-cost", type=float)
+    s.add_argument("--once", action="store_true")
+    for name in ("approve", "deny"):
+        a = sub.add_parser(name, help=f"tier 3: {name} an escalated plan as a human")
+        a.add_argument("plan_id")
+        a.add_argument("--keys", default=".planbound/keys")
+        a.add_argument("--yes", action="store_true")
+    sub.add_parser("pending", help="list approval requests waiting for the signer or a human")
+    sub.add_parser("recover", help="compensate or finish plans a crashed gateway left running")
+    sub.add_parser("draft", help="draft a manifest from the tools actually used in dev mode")
+    sh = sub.add_parser("show", help="print a handle's raw data for a human (never sent to the model)")
+    sh.add_argument("handle")
+    args = p.parse_args(argv)
+
+    if args.cmd == "keys":
+        pubs = generate_keys(args.dir)
+        print(json.dumps({"approval": {"approvers": pubs}}, indent=2))
+        print(f"Private keys written to {args.dir}. Put the public keys above in your manifest.", file=sys.stderr)
+        return
+    cfg = GatewayConfig.load(args.config)
+    if args.cmd == "serve":
+        build_server(Gateway(cfg)).run("stdio")
+    elif args.cmd == "signer":
+        _signer(cfg, args)
+    elif args.cmd in ("approve", "deny"):
+        store = Store(cfg.db_path)
+        req = store.get_approval(args.plan_id)
+        if req is None:
+            sys.exit(f"no approval request for {args.plan_id}")
+        print(describe_request(req))
+        if not args.yes and input(f"{args.cmd} this plan? [y/N] ").strip().lower() != "y":
+            sys.exit("cancelled")
+        signer = PolicySigner(store, Path(cfg.data_dir) / "signer.db", args.keys, BudgetPolicy(budget=float("inf")))
+        print(json.dumps(signer.human_decide(args.plan_id, args.cmd == "approve")))
+    elif args.cmd == "pending":
+        store = Store(cfg.db_path)
+        for req in store.approvals_with_status("pending", "escalated"):
+            print(describe_request(req), end="\n\n")
+    elif args.cmd == "recover":
+        print(json.dumps(asyncio.run(_recover(cfg)), indent=2))
+    elif args.cmd == "draft":
+        out = asyncio.run(_draft(cfg))
+        print(f"Draft written to {out}. Review every entry before using it in enforce mode.")
+    elif args.cmd == "show":
+        store = Store(cfg.db_path)
+        plan_id, node_id = args.handle.removeprefix("h://").split("/")
+        h = store.get_handle(plan_id, node_id)
+        if h is None:
+            sys.exit("unknown handle")
+        print(json.dumps(h["data"], indent=2, ensure_ascii=False))
+
+
+def _signer(cfg: GatewayConfig, args) -> None:
+    policy = BudgetPolicy(budget=args.budget, window_s=args.window_hours * 3600, max_plan_cost=args.max_plan_cost)
+    signer = PolicySigner(Store(cfg.db_path), Path(cfg.data_dir) / "signer.db", args.keys, policy)
+    print(f"Policy signer running: budget {args.budget:g} per {args.window_hours:g}h", file=sys.stderr)
+    while True:
+        for d in signer.process():
+            print(json.dumps(d), flush=True)
+        if args.once:
+            return
+        time.sleep(0.5)
+
+
+async def _recover(cfg: GatewayConfig) -> list[dict]:
+    async with MCPUpstreams(cfg.servers) as up:
+        rt = Runtime(Store(cfg.db_path), up, Manifest.load(cfg.manifest_path), cfg.caller or {},
+                     reader=make_reader(cfg.reader))
+        return await rt.recover()
+
+
+async def _draft(cfg: GatewayConfig) -> Path:
+    store = Store(cfg.db_path)
+    async with MCPUpstreams(cfg.servers) as up:
+        manifest = Manifest(mode="enforce", unlisted_tool_policy="reject")
+        for name in store.used_tools():
+            if name in up.catalog:
+                eff = infer_effects(up.catalog[name], up.catalog)
+                eff.inferred = False
+                eff.description = up.catalog[name].description
+                manifest.tools[name] = eff
+                comp = eff.compensator and eff.compensator["tool"]
+                if comp and comp not in manifest.tools:
+                    ceff = infer_effects(up.catalog[comp], up.catalog)
+                    ceff.inferred, ceff.state = False, "idempotent_write"
+                    manifest.tools[comp] = ceff
+    out = Path(cfg.manifest_path).with_suffix(".draft.json")
+    out.write_text(json.dumps(manifest.to_json(), indent=2))
+    return out
+
+
+if __name__ == "__main__":
+    main()
