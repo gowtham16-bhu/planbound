@@ -6,14 +6,14 @@
       "input_tokens": 8213,
       "output_tokens": 136,
       "tool_calls": 6,
-      "tool_time_s": 0.298,
+      "tool_time_s": 0.296,
       "untrusted_tokens_in_context": 172,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 2,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 5.39
+      "modeled_latency_s": 5.38
     },
     {
       "strategy": "MCP code mode",
@@ -21,29 +21,59 @@
       "input_tokens": 1497,
       "output_tokens": 179,
       "tool_calls": 6,
-      "tool_time_s": 0.42,
+      "tool_time_s": 0.425,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 2,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 4.55
+      "modeled_latency_s": 4.56
     },
     {
-      "strategy": "Planbound",
+      "strategy": "Planbound (JSON plan)",
       "turns": 2,
-      "input_tokens": 3510,
+      "input_tokens": 2127,
       "output_tokens": 348,
       "tool_calls": 6,
-      "tool_time_s": 0.357,
+      "tool_time_s": 0.355,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 2,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 7.51
+      "modeled_latency_s": 7.37
+    },
+    {
+      "strategy": "Planbound (script)",
+      "turns": 2,
+      "input_tokens": 1873,
+      "output_tokens": 187,
+      "tool_calls": 6,
+      "tool_time_s": 0.277,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "done",
+      "refunds_left": 2,
+      "emails_sent": 1,
+      "notes": [],
+      "modeled_latency_s": 4.58
+    },
+    {
+      "strategy": "Planbound (prepared, repeat run)",
+      "turns": 2,
+      "input_tokens": 1766,
+      "output_tokens": 43,
+      "tool_calls": 6,
+      "tool_time_s": 0.273,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "done",
+      "refunds_left": 2,
+      "emails_sent": 1,
+      "notes": [],
+      "modeled_latency_s": 2.17
     }
   ],
   "refund_400_orders": [
@@ -68,29 +98,59 @@
       "input_tokens": 1497,
       "output_tokens": 179,
       "tool_calls": 21,
-      "tool_time_s": 0.425,
+      "tool_time_s": 0.432,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 17,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 4.56
+      "modeled_latency_s": 4.57
     },
     {
-      "strategy": "Planbound",
+      "strategy": "Planbound (JSON plan)",
       "turns": 2,
-      "input_tokens": 3798,
+      "input_tokens": 2130,
       "output_tokens": 348,
       "tool_calls": 21,
-      "tool_time_s": 0.531,
+      "tool_time_s": 0.532,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 17,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 7.71
+      "modeled_latency_s": 7.54
+    },
+    {
+      "strategy": "Planbound (script)",
+      "turns": 2,
+      "input_tokens": 1875,
+      "output_tokens": 187,
+      "tool_calls": 21,
+      "tool_time_s": 0.451,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "done",
+      "refunds_left": 17,
+      "emails_sent": 1,
+      "notes": [],
+      "modeled_latency_s": 4.76
+    },
+    {
+      "strategy": "Planbound (prepared, repeat run)",
+      "turns": 2,
+      "input_tokens": 1768,
+      "output_tokens": 43,
+      "tool_calls": 21,
+      "tool_time_s": 0.452,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "done",
+      "refunds_left": 17,
+      "emails_sent": 1,
+      "notes": [],
+      "modeled_latency_s": 2.35
     }
   ],
   "refund_failure_mid_batch": [
@@ -100,7 +160,7 @@
       "input_tokens": 5882,
       "output_tokens": 101,
       "tool_calls": 5,
-      "tool_time_s": 0.183,
+      "tool_time_s": 0.176,
       "untrusted_tokens_in_context": 172,
       "injection_in_context": false,
       "end_state": "PARTIAL: 1 refunds done, no receipt",
@@ -117,7 +177,7 @@
       "input_tokens": 1508,
       "output_tokens": 179,
       "tool_calls": 5,
-      "tool_time_s": 0.346,
+      "tool_time_s": 0.34,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "PARTIAL: 1 refunds done, no receipt",
@@ -126,15 +186,15 @@
       "notes": [
         "the script raised mid-batch; refunds that already ran stay done"
       ],
-      "modeled_latency_s": 4.48
+      "modeled_latency_s": 4.47
     },
     {
-      "strategy": "Planbound",
+      "strategy": "Planbound (JSON plan)",
       "turns": 2,
-      "input_tokens": 3391,
+      "input_tokens": 2045,
       "output_tokens": 348,
       "tool_calls": 6,
-      "tool_time_s": 0.371,
+      "tool_time_s": 0.367,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "clean (nothing changed)",
@@ -143,7 +203,41 @@
       "notes": [
         "plan ended failed_compensated: billing.refund_order failed: Error executing tool refund_order: payment processor declined refund for ORD-1009"
       ],
-      "modeled_latency_s": 7.51
+      "modeled_latency_s": 7.37
+    },
+    {
+      "strategy": "Planbound (script)",
+      "turns": 2,
+      "input_tokens": 1882,
+      "output_tokens": 187,
+      "tool_calls": 6,
+      "tool_time_s": 0.278,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "clean (nothing changed)",
+      "refunds_left": 0,
+      "emails_sent": 0,
+      "notes": [
+        "plan ended failed_compensated: billing.refund_order failed: Error executing tool refund_order: payment processor declined refund for ORD-1009"
+      ],
+      "modeled_latency_s": 4.58
+    },
+    {
+      "strategy": "Planbound (prepared, repeat run)",
+      "turns": 2,
+      "input_tokens": 1776,
+      "output_tokens": 43,
+      "tool_calls": 6,
+      "tool_time_s": 0.275,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "clean (nothing changed)",
+      "refunds_left": 0,
+      "emails_sent": 0,
+      "notes": [
+        "plan ended failed_compensated: billing.refund_order failed: Error executing tool refund_order: payment processor declined refund for ORD-1009"
+      ],
+      "modeled_latency_s": 2.17
     }
   ],
   "injected_order_note": [
@@ -153,14 +247,14 @@
       "input_tokens": 8257,
       "output_tokens": 136,
       "tool_calls": 6,
-      "tool_time_s": 0.271,
+      "tool_time_s": 0.259,
       "untrusted_tokens_in_context": 227,
       "injection_in_context": true,
       "end_state": "done",
       "refunds_left": 2,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 5.36
+      "modeled_latency_s": 5.35
     },
     {
       "strategy": "MCP code mode",
@@ -168,29 +262,59 @@
       "input_tokens": 1497,
       "output_tokens": 179,
       "tool_calls": 6,
-      "tool_time_s": 0.421,
+      "tool_time_s": 0.432,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 2,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 4.55
+      "modeled_latency_s": 4.57
     },
     {
-      "strategy": "Planbound",
+      "strategy": "Planbound (JSON plan)",
       "turns": 2,
-      "input_tokens": 3510,
+      "input_tokens": 2127,
       "output_tokens": 348,
       "tool_calls": 6,
-      "tool_time_s": 0.364,
+      "tool_time_s": 0.352,
       "untrusted_tokens_in_context": 0,
       "injection_in_context": false,
       "end_state": "done",
       "refunds_left": 2,
       "emails_sent": 1,
       "notes": [],
-      "modeled_latency_s": 7.51
+      "modeled_latency_s": 7.36
+    },
+    {
+      "strategy": "Planbound (script)",
+      "turns": 2,
+      "input_tokens": 1873,
+      "output_tokens": 187,
+      "tool_calls": 6,
+      "tool_time_s": 0.277,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "done",
+      "refunds_left": 2,
+      "emails_sent": 1,
+      "notes": [],
+      "modeled_latency_s": 4.58
+    },
+    {
+      "strategy": "Planbound (prepared, repeat run)",
+      "turns": 2,
+      "input_tokens": 1766,
+      "output_tokens": 43,
+      "tool_calls": 6,
+      "tool_time_s": 0.282,
+      "untrusted_tokens_in_context": 0,
+      "injection_in_context": false,
+      "end_state": "done",
+      "refunds_left": 2,
+      "emails_sent": 1,
+      "notes": [],
+      "modeled_latency_s": 2.18
     }
   ]
 }

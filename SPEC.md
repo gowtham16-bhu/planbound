@@ -121,6 +121,22 @@ anything else → `irreversible`), results are marked unverified, and tool usage
 | `display` | `input` | data is written for the human; the model sees only a receipt |
 | `checkpoint` | `handle` (`h://plan/node` from an earlier plan's summary), `max_age_seconds`? | that saved result, as if read again: same labels and trust, field checks against its data |
 
+**Plan scripts.** The same plan can be sent as a script, which is shorter to write: a subset of
+Python syntax parsed with `ast` and never executed (`planbound/script.py`). Each statement is
+`step = server.tool(arg=value, when=cond, after=[steps])` or `step = filter|partition|map|
+quarantine_read|display|checkpoint(...)`; values are literals, `step.path`, `item.field`,
+`caller.attr`, `param.name` and `count|sum|...(step, "field")`; conditions use Python comparison
+and boolean operators; `return a, b` sets `return`; a leading `# goal:` comment sets the goal. It
+translates one-to-one into the JSON plan, so every compiler check applies; anything outside the
+subset is an `E_SCRIPT` error with its line.
+
+**Prepared plans.** `planbound_prepare(name, script|plan, example)` stores a plan with `param.*`
+placeholders for the caller, after checking it compiles with the example values;
+`planbound_run(name, params)` binds the params (exact names and types) and submits the result as an
+ordinary plan: compiled, previewed, approved and journaled like any other. Plans with unbound
+placeholders cannot be submitted directly (`E_PARAM`). The tool index lists the caller's prepared
+plans.
+
 **Values:** literals, `{"$ref": "node.a.b"}`, `{"$item": "field"}` (map args, `where`),
 `{"$agg": {"fn": "count|distinct_count|sum|min|max|mean", "of": "node.path", "field": "f", "default": d}}`,
 `{"$caller": "attr"}`.
@@ -271,4 +287,5 @@ Still true and stated plainly:
 - **Approval channel.** The gateway only holds public keys; the policy signer and the human must run
   where the agent cannot reach their private keys.
 - **Identity comes from the host.** The caller comes from config or `PLANBOUND_CALLER`.
-- **Plans cost more output tokens than a code-mode script** (see `bench/RESULTS.md`).
+- **Cost.** A script plan costs about what a code-mode script costs (see `bench/RESULTS.md`); a JSON
+  plan costs about twice the output, and a prepared plan a fraction of either.

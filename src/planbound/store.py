@@ -71,6 +71,14 @@ CREATE TABLE IF NOT EXISTS approvals (
     expires_at   REAL NOT NULL,
     created_at   REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prepared (
+    name        TEXT NOT NULL,
+    caller_json TEXT NOT NULL,
+    raw_json    TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (name, caller_json)
+);
 CREATE TABLE IF NOT EXISTS usage (
     tool TEXT PRIMARY KEY,
     calls INTEGER NOT NULL
@@ -188,6 +196,22 @@ class Store:
 
     def mark_alerted(self, plan_id: str) -> None:
         self.db.execute("UPDATE plans SET alerted_at = ? WHERE plan_id = ?", (time.time(), plan_id))
+
+    # ---------------------------------------------------------------- prepared plans
+
+    def put_prepared(self, name: str, caller: dict, raw: dict, params: dict) -> None:
+        self.db.execute("INSERT OR REPLACE INTO prepared VALUES (?,?,?,?,?)",
+                        (name, json.dumps(caller, sort_keys=True), json.dumps(raw), json.dumps(params), time.time()))
+
+    def get_prepared(self, name: str, caller: dict) -> dict | None:
+        row = self.db.execute("SELECT raw_json, params_json FROM prepared WHERE name = ? AND caller_json = ?",
+                              (name, json.dumps(caller, sort_keys=True))).fetchone()
+        return {"raw": json.loads(row[0]), "params": json.loads(row[1])} if row else None
+
+    def list_prepared(self, caller: dict) -> dict[str, dict]:
+        rows = self.db.execute("SELECT name, params_json FROM prepared WHERE caller_json = ? ORDER BY name",
+                               (json.dumps(caller, sort_keys=True),))
+        return {r[0]: json.loads(r[1]) for r in rows}
 
     def request_cancel(self, plan_id: str) -> None:
         self.db.execute("UPDATE plans SET cancel_requested = 1 WHERE plan_id = ?", (plan_id,))

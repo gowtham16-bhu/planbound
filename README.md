@@ -5,7 +5,8 @@
 AI agents don't need a babysitter. They need a budget.
 
 Planbound sits between your agent and your existing MCP servers. Instead of calling tools one
-by one (or running a generated script), the agent sends **one bounded plan**. Planbound:
+by one (or running a generated script), the agent sends **one bounded plan**, written as a short
+script that Planbound parses (never runs), or runs a plan it prepared earlier by name. Planbound:
 
 1. **checks it** before anything runs: bounds, data flow, who it may act on, a safe order;
 2. **runs only the reads** and shows the exact impact: *"2 refunds, ₹4,500, 1 email"*;
@@ -52,29 +53,37 @@ Agent ──plan──► Planbound: Check ─► Preview ─► Approve ─► 
 
 ## Benchmark (real MCP calls, simulated model)
 
-Same task three ways: *refund C-42's overdue orders under ₹5,000 with no open dispute, email one receipt*.
+Same task every way: *refund C-42's overdue orders under ₹5,000 with no open dispute, email one receipt*.
 Direct calling gets every advantage (parallel tool calls, server-side status filter). Full table: [bench/RESULTS.md](bench/RESULTS.md).
 
-| | Direct MCP | Code mode | Planbound |
-|---|---|---|---|
-| LLM turns | 4 | 2 | **2** |
-| Tokens the model reads | 8,213 | 1,497 | 3,510 |
-| Tokens the model writes | 136 | 179 | 348 |
-| Untrusted text in the model's context (injected note) | 227 tok, **incl. injection** | 0 (this script didn't print it) | **0 (by construction)** |
-| One refund fails mid-batch | **1 refund left done** | **1 refund left done** | **nothing changed** |
-| Modeled latency | 5.4s | **4.6s** | 7.5s |
+| | Direct MCP | Code mode | Planbound, JSON plan | Planbound, script | Planbound, prepared (repeat run) |
+|---|---|---|---|---|---|
+| LLM turns | 4 | 2 | 2 | 2 | **2** |
+| Tokens the model reads | 8,213 | **1,497** | 2,127 | 1,873 | 1,766 |
+| Tokens the model writes | 136 | 179 | 348 | 187 | **43** |
+| Untrusted text in context (injected note) | 227 tok, **incl. injection** | 0 (this script didn't print it) | **0 (by construction)** | **0** | **0** |
+| One refund fails mid-batch | **1 refund left done** | **1 refund left done** | **nothing changed** | **nothing changed** | **nothing changed** |
+| Modeled latency | 5.4s | 4.6s | 7.4s | 4.6s | **2.2s** |
 
-Honest reading: Planbound matches code mode on turns, writes about twice the tokens of a short
-script (a JSON plan is verbose), and is slower in this latency model, which charges 60 tok/s for
-output. It wins on what code mode can't promise: the impact is known before anything is written,
-untrusted text can't reach the model, and failures leave nothing half-done. The model is
-simulated; run against a real model before quoting latency.
+Where the cost went, and what removed it:
+- **Output tokens drive latency** (60 tok/s in this model). A JSON plan is verbose, so plans can be
+  written as a **script**: a small subset of Python syntax that is only parsed, never run, and
+  translates one-to-one into the same JSON plan (`tests/test_script.py` checks they are identical).
+  Same checks, about half the output; script plans now match code mode.
+- **Repeated tasks** don't need a plan at all: `planbound_prepare` stores a plan with `param.*`
+  placeholders once, then `planbound_run(name, params)` costs ~40 output tokens. Every run is still
+  compiled, previewed, approved and journaled. (The first run costs what the script row costs.)
+- **Input tokens**: the plan guide was sent twice (server instructions *and* the tool index) and is
+  now sent once, in a shorter, script-first form; summaries no longer list every unique id (they
+  stay one `planbound_inspect_handle` call away).
+
+The model is simulated; `bench/live.py` measures the same with a real model.
 
 ## Quick start
 
 ```bash
 uv sync --all-groups
-uv run pytest -q                     # 109 tests, incl. fault injection
+uv run pytest -q                     # 127 tests, incl. fault injection
 uv run --extra reader python -m bench.live   # real model + live reader check (needs API credentials)
 uv run python -m bench.run           # writes bench/RESULTS.md
 uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys

@@ -23,7 +23,8 @@ async def test_agent_uses_planbound_over_plain_mcp(tmp_path):
     async with Client(build_server(Gateway(cfg))) as agent:
         names = {t.name for t in (await agent.list_tools()).tools}
         assert names == {"planbound_search_tools", "planbound_submit_plan", "planbound_commit",
-                         "planbound_inspect_handle", "planbound_cancel"}
+                         "planbound_inspect_handle", "planbound_cancel",
+                         "planbound_prepare", "planbound_run"}
         index = (await agent.call_tool("planbound_search_tools", {})).structured_content
         sigs = [t["signature"] for t in index["tools"]]
         assert any(s.startswith("billing.refund_order(order_id, amount, reason?, expected_version?)") for s in sigs)

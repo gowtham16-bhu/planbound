@@ -23,6 +23,7 @@ from .manifest import (
     parse_io_path,
 )
 from .plan import (
+    ID_RE,
     PENDING,
     SKIPPED,
     Ctx,
@@ -34,6 +35,7 @@ from .plan import (
     resolve,
     split_path,
 )
+from .script import ScriptError, is_script, parse_script
 from .store import Store
 from .summary import summarize
 
@@ -164,6 +166,16 @@ class Runtime:
                 "caller": rec["caller"], "plan_status": rec["status"], "skipped": h["data"] == SKIP_MARK}
 
     async def submit(self, raw: Any, mode: str = "execute", wait_seconds: float = 0) -> dict:
+        if is_script(raw):
+            try:
+                raw = parse_script(raw)
+            except ScriptError as e:
+                return e.to_json()
+        if _has_params(raw):
+            return {"status": "compile_error", "errors": [{
+                "code": "E_PARAM", "node_id": None, "path": "$",
+                "message": "This plan has param.* placeholders: prepare it with planbound_prepare, then run "
+                           "it with planbound_run."}]}
         try:
             compiled = self.compile(raw)
         except CompileError as e:
@@ -186,6 +198,48 @@ class Runtime:
                                     self.manifest.approval_ttl_s)
         self.store.update_plan(plan_id, status="awaiting_approval")
         return await self.commit(plan_id, wait_seconds=wait_seconds, _preview=preview)
+
+    # ---------------------------------------------------------------- prepared plans
+
+    async def prepare(self, name: str, raw: Any, example: dict) -> dict:
+        """Store a plan with param.* placeholders under a name, after checking it compiles with `example`.
+
+        Later runs send only the name and parameters: a few dozen output tokens instead of a whole plan.
+        Every run is still substituted, compiled, previewed and approved like any other plan."""
+        if is_script(raw):
+            try:
+                raw = parse_script(raw)
+            except ScriptError as e:
+                return e.to_json()
+        if not isinstance(name, str) or not ID_RE.match(name):
+            return {"status": "error", "message": "name must be lowercase letters, digits and _"}
+        names = sorted(_param_names(raw))
+        if set(example) != set(names):
+            return {"status": "error", "message": f"example must give exactly the params {names}"}
+        bad = [k for k, v in example.items() if not isinstance(v, (str, int, float, bool))]
+        if bad:
+            return {"status": "error", "message": f"params must be strings, numbers or booleans: {bad}"}
+        try:
+            compiled = self.compile(_bind(raw, example))
+        except CompileError as e:
+            return e.to_json()
+        params = {k: type(v).__name__ for k, v in example.items()}
+        self.store.put_prepared(name, self.caller, raw, params)
+        return {"status": "prepared", "name": name, "params": params, "worst_case": compiled.worst_case}
+
+    async def run_prepared(self, name: str, params: dict, mode: str = "execute", wait_seconds: float = 0) -> dict:
+        prepared = self.store.get_prepared(name, self.caller)
+        if prepared is None:
+            return {"status": "error", "message": f"no prepared plan {name!r}",
+                    "prepared": sorted(self.store.list_prepared(self.caller))}
+        want = prepared["params"]
+        if set(params) != set(want):
+            return {"status": "error", "message": f"{name} takes exactly {sorted(want)}"}
+        wrong = [k for k, v in params.items() if type(v).__name__ != want[k]
+                 and not (want[k] == "float" and type(v) is int)]
+        if wrong:
+            return {"status": "error", "message": f"wrong types for {wrong}; expected {want}"}
+        return await self.submit(_bind(prepared["raw"], params), mode=mode, wait_seconds=wait_seconds)
 
     async def commit(self, plan_id: str, wait_seconds: float = 0, _preview: dict | None = None) -> dict:
         rec = self.store.get_plan(plan_id)
@@ -975,12 +1029,10 @@ class Runtime:
             return {"handle": f"h://{run.plan_id}/{nid}", "skipped": True}
         if value is PENDING:
             return {"handle": f"h://{run.plan_id}/{nid}", "pending": True}
-        return {
-            "handle": f"h://{run.plan_id}/{nid}",
-            "source_tool": ni.tool,
-            "labels": sorted(ni.labels),
-            "summary": summarize(value, trusted=ni.trust == "trusted"),
-        }
+        out = {"handle": f"h://{run.plan_id}/{nid}", "summary": summarize(value, trusted=ni.trust == "trusted")}
+        if ni.labels:
+            out["labels"] = sorted(ni.labels)
+        return out
 
     def _result(self, run: Run, status: str, *, failure: NodeFailure | None = None,
                 compensation: dict | None = None, note: str | None = None,
@@ -1027,6 +1079,31 @@ def _waves_of(nodes: list[str], deps: dict[str, set[str]], done: set[str]) -> li
         finished |= set(wave)
         remaining = [n for n in remaining if n not in finished]
     return waves
+
+
+def _param_names(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        if set(value) == {"$param"}:
+            return {value["$param"]}
+        return set().union(*(_param_names(v) for v in value.values())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(_param_names(v) for v in value)) if value else set()
+    return set()
+
+
+def _has_params(value: Any) -> bool:
+    return bool(_param_names(value))
+
+
+def _bind(value: Any, params: dict) -> Any:
+    """Replace every {"$param": name} with its value: the result is an ordinary plan."""
+    if isinstance(value, dict):
+        if set(value) == {"$param"}:
+            return params[value["$param"]]
+        return {k: _bind(v, params) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_bind(v, params) for v in value]
+    return value
 
 
 def _raise_if_fenced(error: Exception, plan_id: str) -> None:
