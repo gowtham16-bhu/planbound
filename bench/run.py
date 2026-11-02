@@ -198,17 +198,41 @@ async def code_mode(world, up) -> Metrics:
 # ---------------------------------------------------------------- strategy 3: Planbound
 
 
-async def planbound(world, up, tmp: Path) -> Metrics:
-    m = Metrics("Planbound")
+SCRIPT = """# goal: refund C-42's overdue orders under 5000 without disputes, email one receipt
+cust = crm.get_customer(customer_id="C-42")
+orders = billing.list_orders(customer_id="C-42", status="overdue")
+disputes = billing.list_disputes(customer_id="C-42")
+eligible = filter(orders.orders, item.amount < 5000 and item.order_id not in disputes.order_ids)
+refunds = map(eligible, billing.refund_order(order_id=item.order_id, amount=item.amount), max_items=20)
+notify = email.send_email(to=cust.email, template="refund_processed",
+  vars={"count": count(eligible), "total": sum(eligible, "amount")}, when=count(eligible) > 0, after=[refunds])
+return eligible, notify"""
+PREPARED = SCRIPT.replace('"C-42"', "param.customer").replace("5000", "param.max_amount")
+RUN_CALL = json.dumps({"name": "refund_overdue", "params": {"customer": "C-42", "max_amount": 5000}})
+
+
+async def planbound(world, up, tmp: Path, variant: str = "json") -> Metrics:
+    m = Metrics({"json": "Planbound (JSON plan)", "script": "Planbound (script)",
+                 "prepared": "Planbound (prepared, repeat run)"}[variant])
     rt = Runtime(Store(tmp / f"bench-{time.time_ns()}.db"), up, refund_manifest(up.catalog, auto_max=1e9),
                  {"user": "ops"}, display_dir=tmp / "display")
-    index = json.dumps(search_index(rt))
+    if variant == "prepared":  # done once earlier, e.g. the first time this task came up
+        await rt.prepare("refund_overdue", PREPARED, {"customer": "C-42", "max_amount": 5000})
+    index = json.dumps(search_index(rt))  # the guide itself is in the server instructions, sent once
     conv = Conversation(m, SYSTEM + PLAN_GUIDE + index + TASK)
-    plan = refund_plan()
-    conv.turn(json.dumps(plan))
     before = dict(world.calls)
-    start = time.perf_counter()
-    result = await rt.submit(plan)
+    if variant == "json":
+        conv.turn(json.dumps(refund_plan()))
+        start = time.perf_counter()
+        result = await rt.submit(refund_plan())
+    elif variant == "script":
+        conv.turn(SCRIPT)
+        start = time.perf_counter()
+        result = await rt.submit(SCRIPT)
+    else:
+        conv.turn(RUN_CALL)
+        start = time.perf_counter()
+        result = await rt.run_prepared("refund_overdue", {"customer": "C-42", "max_amount": 5000})
     m.tool_time_s = time.perf_counter() - start
     m.tool_calls = sum(world.calls.values()) - sum(before.values())
     conv.observe(json.dumps(result), untrusted_texts(world))
@@ -236,13 +260,13 @@ async def run_one(strategy: str, spec: dict, tmp: Path) -> Metrics:
         overdue = [o for o in world.orders.values() if o.status == "overdue" and o.amount < 5000
                    and o.order_id not in world.disputed]
         world.fail_refund_on = {max(o.order_id for o in overdue)}
-    async with MCPUpstreams(build_servers(world)) as up:
+    async with MCPUpstreams(build_servers(world, extras=False)) as up:
         if strategy == "direct":
             m = await direct(world, up)
         elif strategy == "code":
             m = await code_mode(world, up)
         else:
-            m = await planbound(world, up, tmp)
+            m = await planbound(world, up, tmp, strategy.split(":")[1])
     m.refunds_left = len(world.refunded())
     m.emails_sent = len(world.emails)
     if fail_one:
@@ -259,10 +283,12 @@ async def main() -> None:
     tmp.mkdir(parents=True, exist_ok=True)
     results = {}
     for name, spec in WORKLOADS.items():
-        results[name] = [await run_one(s, spec, tmp) for s in ("direct", "code", "planbound")]
+        results[name] = [await run_one(s, spec, tmp) for s in
+                         ("direct", "code", "planbound:json", "planbound:script", "planbound:prepared")]
     lines = ["# Planbound benchmark (simulated model, real MCP calls)", "",
              (f"Latency model: {TTFT_S}s per turn + input/{PREFILL_TPS} tok/s + output/{DECODE_TPS} tok/s "
-              "+ measured tool time. Tokens ≈ characters / 4."), ""]
+              "+ measured tool time. Tokens ≈ characters / 4. The prepared row is a repeat run: the plan was "
+              "prepared once before (that first run costs the same as the script row)."), ""]
     for name, rows in results.items():
         lines += [f"## {name}", "",
                   ("| Strategy | LLM turns | Input tokens | Output tokens | Tool calls | Untrusted text in context "

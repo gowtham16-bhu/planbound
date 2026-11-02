@@ -7,6 +7,7 @@ same MCP path as production.
 import asyncio
 import copy
 import dataclasses
+import json
 import time
 
 import pytest
@@ -305,7 +306,7 @@ def test_compensators_must_be_safe_to_retry():
     with pytest.raises(ValueError, match="must be listed"):
         Manifest.from_json({"tools": tools})
     tools["billing.cancel_refund"] = {"state": "irreversible"}
-    with pytest.raises(ValueError, match="retried during rollback"):
+    with pytest.raises(ValueError, match="is retried"):
         Manifest.from_json({"tools": tools})
     tools["billing.cancel_refund"]["idempotency_keys"] = True
     Manifest.from_json({"tools": tools})
@@ -428,3 +429,119 @@ async def test_journal_refuses_writes_from_a_process_without_the_lease(env):
     assert env.store.claim(plan_id, "next", 60, ("previewed",))
     assert env.store.renew(plan_id, "next", 60) == first + 1  # a new holder means a new epoch
     assert env.store.renew(plan_id, "someone", 60) is None
+
+
+# ---------------------------------------------------------------- outcome checks: no human for lost answers
+
+
+def with_outcome_check(env, **overrides):
+    m = manifest(env, idempotency_keys=False, outcome_check={
+        "tool": "billing.find_refunds", "args": {"order_id": "$input.order_id"},
+        "found": "$output.refunds", "settle_seconds": 0, **overrides})
+    m.tools["billing.find_refunds"] = dataclasses.replace(m.tools["billing.list_disputes"], description="lookup",
+                                                          contract_sha256=None)
+    return m
+
+
+async def test_lost_answer_is_settled_by_asking_the_upstream(env):
+    up = Faulty(env.up)
+    up.lose_answer("billing.refund_order")  # no idempotency keys, so it cannot simply be re-sent
+    want = eligible_ids(env.world)
+    res = await env.runtime(with_outcome_check(env), upstreams=up).submit(refund_plan())
+    assert res["status"] == "completed", res  # the lookup found the refund: no human needed
+    assert env.world.refunded() == want and len(env.world.refunds) == len(want)
+
+
+async def test_crash_without_keys_is_settled_by_the_outcome_check(env):
+    m = with_outcome_check(env)
+    rt = env.runtime(m)
+    rt.crash_after_writes = 1
+    with pytest.raises(SimulatedCrash):
+        await rt.submit(refund_plan())
+    report = (await env.runtime(m).recover())[0]
+    assert report["status"] == "recovered_compensated", report  # the old code needed `resolve` here
+    assert env.world.refunded() == []
+
+
+async def test_a_write_that_never_arrived_is_marked_failed_once_settled(env):
+    up = Faulty(env.up)
+    up.down("billing.refund_order")  # the request never reached billing
+    m = with_outcome_check(env, settle_seconds=3600)
+    res = await env.runtime(m, upstreams=up).submit(refund_plan())
+    assert res["status"] == "needs_attention", res  # absent, but a late request could still land
+    env.store.db.execute("UPDATE journal SET updated_at = updated_at - 7200 WHERE status = 'UNKNOWN'")
+    report = (await env.runtime(m).recover())[0]
+    assert report["status"] == "recovered_compensated", report
+    assert env.world.refunded() == []
+
+
+# ---------------------------------------------------------------- don't start what could not be undone
+
+
+def with_undo_probe(env):
+    m = manifest(env, undo_probe={"tool": "billing.find_refunds", "args": {"order_id": "ORD-0"}})
+    m.tools["billing.find_refunds"] = dataclasses.replace(m.tools["billing.list_disputes"], contract_sha256=None)
+    return m
+
+
+async def test_plan_does_not_start_while_its_undo_service_is_down(env):
+    up = Faulty(env.up)
+    up.down("billing.find_refunds")  # billing's undo side is unreachable right now
+    m = with_undo_probe(env)
+    rt = env.runtime(m, upstreams=up)
+    res = await rt.submit(refund_plan())
+    assert res["status"] == "deferred" and res["unavailable"], res
+    assert env.world.refunds == {} and env.store.journal(res["plan_id"]) == []
+    again = await rt.commit(res["plan_id"])  # the service is back
+    assert again["status"] == "completed", again
+
+
+# ---------------------------------------------------------------- alerts for plans that stay stuck
+
+
+async def test_operator_is_alerted_once_about_a_stuck_plan(env, tmp_path):
+    import sys
+
+    from planbound.gateway import parse_alerts, send_alerts
+
+    up = Faulty(env.up)
+    up.down("billing.cancel_refund", times=100)
+    env.world.fail_refund_on = {eligible_ids(env.world)[-1]}
+    res = await env.runtime(manifest(env), upstreams=up, compensation_attempts=1).submit(refund_plan())
+    assert res["status"] == "failed_partial"
+    out = tmp_path / "alert.json"
+    alerts = parse_alerts({"command": [sys.executable, "-c",
+                                       "import sys, pathlib; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read())",
+                                       str(out)], "after_seconds": 600})
+    assert await send_alerts(env.store, alerts) == []  # not stuck long enough yet
+    env.store.db.execute("UPDATE plans SET stuck_since = stuck_since - 3600")
+    assert await send_alerts(env.store, alerts) == [res["plan_id"]]
+    assert json.loads(out.read_text())["plan_id"] == res["plan_id"]
+    assert await send_alerts(env.store, alerts) == []  # once per plan
+    up.rules.clear()
+    await env.runtime(manifest(env)).recover()
+    assert env.store.get_plan(res["plan_id"])["stuck_since"] is None  # resolved: no longer stuck
+
+
+def test_alert_config_is_validated():
+    from planbound.gateway import parse_alerts
+
+    with pytest.raises(ValueError):
+        parse_alerts({"command": "notify-send"})
+    with pytest.raises(ValueError):
+        parse_alerts({"command": ["x"], "after_seconds": -1})
+    assert parse_alerts(None) is None
+
+
+def test_outcome_check_and_undo_probe_must_use_read_only_tools():
+    base = {"billing.refund_order": {"state": "compensatable",
+                                     "compensator": {"tool": "billing.cancel_refund", "args": {}}},
+            "billing.cancel_refund": {"state": "idempotent_write"}}
+    bad = {**base, "billing.refund_order": {**base["billing.refund_order"], "outcome_check": {
+        "tool": "billing.cancel_refund", "args": {}, "found": "$output.x"}}}
+    with pytest.raises(ValueError, match="listed read_only"):
+        Manifest.from_json({"tools": bad})
+    bad = {**base, "billing.refund_order": {**base["billing.refund_order"],
+                                            "undo_probe": {"tool": "billing.cancel_refund", "args": {}}}}
+    with pytest.raises(ValueError, match="undo_probe"):
+        Manifest.from_json({"tools": bad})

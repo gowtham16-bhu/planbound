@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS plans (
     updated_at   REAL NOT NULL,
     lease_owner  TEXT,
     lease_until  REAL,
-    lease_epoch  INTEGER NOT NULL DEFAULT 0
+    lease_epoch  INTEGER NOT NULL DEFAULT 0,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    phase        TEXT,
+    stuck_since  REAL,
+    alerted_at   REAL
 );
 CREATE TABLE IF NOT EXISTS handles (
     plan_id     TEXT NOT NULL,
@@ -67,11 +71,22 @@ CREATE TABLE IF NOT EXISTS approvals (
     expires_at   REAL NOT NULL,
     created_at   REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS prepared (
+    name        TEXT NOT NULL,
+    caller_json TEXT NOT NULL,
+    raw_json    TEXT NOT NULL,
+    params_json TEXT NOT NULL,
+    created_at  REAL NOT NULL,
+    PRIMARY KEY (name, caller_json)
+);
 CREATE TABLE IF NOT EXISTS usage (
     tool TEXT PRIMARY KEY,
     calls INTEGER NOT NULL
 );
 """
+
+
+STUCK_STATUSES = ("failed_partial", "needs_attention")
 
 
 class Store:
@@ -86,7 +101,9 @@ class Store:
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(plans)")}
         for col, kind in (("lease_owner", "TEXT"), ("lease_until", "REAL"),
-                          ("lease_epoch", "INTEGER NOT NULL DEFAULT 0")):
+                          ("lease_epoch", "INTEGER NOT NULL DEFAULT 0"),
+                          ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"), ("phase", "TEXT"),
+                          ("stuck_since", "REAL"), ("alerted_at", "REAL")):
             if col not in cols:  # databases created before leases existed
                 self.db.execute(f"ALTER TABLE plans ADD COLUMN {col} {kind}")
         if "created_at" not in {r[1] for r in self.db.execute("PRAGMA table_info(handles)")}:
@@ -100,9 +117,9 @@ class Store:
     def create_plan(self, plan_id: str, plan_hash: str, raw: dict, caller: dict) -> None:
         now = time.time()
         self.db.execute(
-            "INSERT INTO plans VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO plans VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (plan_id, plan_hash, json.dumps(raw), json.dumps(caller), "compiled", None, None, None, now, now,
-             None, None, 0),
+             None, None, 0, 0, None, None, None),
         )
 
     def update_plan(self, plan_id: str, **fields: Any) -> None:
@@ -115,6 +132,13 @@ class Store:
             vals.append(value)
         if "status" in fields and fields["status"] != "running" and "lease_owner" not in fields:
             cols.append("lease_owner = NULL")  # the plan stopped: whoever ran it lets go
+        if "status" in fields:  # when a plan first got stuck, for alerts
+            if fields["status"] in STUCK_STATUSES:
+                cols.append("stuck_since = COALESCE(stuck_since, ?)")
+                vals.append(time.time())
+            else:
+                cols.append("stuck_since = NULL")
+                cols.append("alerted_at = NULL")
         cols.append("updated_at = ?")
         vals.extend([time.time(), plan_id])
         self.db.execute(f"UPDATE plans SET {', '.join(cols)} WHERE plan_id = ?", vals)
@@ -161,6 +185,40 @@ class Store:
         if cur.rowcount != 1:
             return None
         return int(self.db.execute("SELECT lease_epoch FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()[0])
+
+    def stuck_plans(self, older_than_s: float) -> list[dict]:
+        """Plans stuck for longer than `older_than_s` that nobody has been alerted about yet."""
+        q = ",".join("?" for _ in STUCK_STATUSES)
+        rows = self.db.execute(
+            f"SELECT plan_id FROM plans WHERE status IN ({q}) AND stuck_since IS NOT NULL"
+            " AND stuck_since <= ? AND alerted_at IS NULL", (*STUCK_STATUSES, time.time() - older_than_s))
+        return [self.get_plan(r[0]) for r in rows.fetchall()]
+
+    def mark_alerted(self, plan_id: str) -> None:
+        self.db.execute("UPDATE plans SET alerted_at = ? WHERE plan_id = ?", (time.time(), plan_id))
+
+    # ---------------------------------------------------------------- prepared plans
+
+    def put_prepared(self, name: str, caller: dict, raw: dict, params: dict) -> None:
+        self.db.execute("INSERT OR REPLACE INTO prepared VALUES (?,?,?,?,?)",
+                        (name, json.dumps(caller, sort_keys=True), json.dumps(raw), json.dumps(params), time.time()))
+
+    def get_prepared(self, name: str, caller: dict) -> dict | None:
+        row = self.db.execute("SELECT raw_json, params_json FROM prepared WHERE name = ? AND caller_json = ?",
+                              (name, json.dumps(caller, sort_keys=True))).fetchone()
+        return {"raw": json.loads(row[0]), "params": json.loads(row[1])} if row else None
+
+    def list_prepared(self, caller: dict) -> dict[str, dict]:
+        rows = self.db.execute("SELECT name, params_json FROM prepared WHERE caller_json = ? ORDER BY name",
+                               (json.dumps(caller, sort_keys=True),))
+        return {r[0]: json.loads(r[1]) for r in rows}
+
+    def request_cancel(self, plan_id: str) -> None:
+        self.db.execute("UPDATE plans SET cancel_requested = 1 WHERE plan_id = ?", (plan_id,))
+
+    def cancel_requested(self, plan_id: str) -> bool:
+        row = self.db.execute("SELECT cancel_requested FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()
+        return bool(row and row[0])
 
     def plans_with_status(self, *statuses: str) -> list[str]:
         q = ",".join("?" for _ in statuses)

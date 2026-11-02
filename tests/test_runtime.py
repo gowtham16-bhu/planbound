@@ -164,7 +164,7 @@ async def test_quarantined_reader_classifies_untrusted_notes(injected_env):
     res = await auto(env, reader=reader).submit(plan)
     assert res["status"] == "completed", res
     s = res["summaries"]["damaged"]["summary"]
-    assert s["fields"]["topic"]["histogram"] == {"damage": s["count"]}
+    assert s["fields"]["topic"] == {"type": "string", "value": "damage"}  # every item is "damage"
     assert "IGNORE" not in json.dumps(res)
 
 

@@ -71,6 +71,22 @@ class ToolEffects:
     # The operator confirms the upstream checks io.planbound/fencing-token: it refuses a write whose
     # lease epoch is lower than one it already saw for that plan. Closes the stalled-gateway gap.
     fencing: bool = False
+    # {"tool": <read_only tool>, "args": {...$input/$output paths...}, "found": "$output.<path>",
+    #  "settle_seconds"?: 30}: asks the upstream whether a write whose answer was lost happened.
+    # Non-empty `found` → it happened (that value is its result); empty for settle_seconds → it did not.
+    outcome_check: dict | None = None
+    # Reservation (try / confirm / cancel). The write only *holds* the effect, invisible to everyone
+    # else; Planbound sends `confirm` ({"tool", "args"} over $input/$output) once the plan is past its
+    # point of no return. Anything failing before that cancels the hold (the compensator), so nobody
+    # ever saw it.
+    confirm: dict | None = None
+    # Irreversible steps: wait this long before sending, so `planbound cancel` can still stop the plan.
+    hold_seconds: float = 0.0
+    # The attestation `planbound verify` printed: proof the upstream honours what is claimed above.
+    verified: dict | None = None
+    # {"tool": <read_only tool>, "args": {...}}: a cheap call to the service this tool's undo (and
+    # confirm) depend on. If it fails before a plan starts writing, the plan does not start.
+    undo_probe: dict | None = None
     confirm_read_only: bool = False
     inferred: bool = False
 
@@ -89,6 +105,10 @@ class ToolEffects:
             "identity",
             "allowed_input_labels",
             "conditional",
+            "outcome_check",
+            "confirm",
+            "verified",
+            "undo_probe",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -105,6 +125,8 @@ class ToolEffects:
             out["idempotency_keys"] = True
         if self.fencing:
             out["fencing"] = True
+        if self.hold_seconds:
+            out["hold_seconds"] = self.hold_seconds
         if self.confirm_read_only:
             out["confirm_read_only"] = True
         return out
@@ -118,6 +140,11 @@ class Manifest:
     auto_approve_max_cost: float = 0.0
     approval_ttl_s: int = 300
     strict_writes: bool = False
+    # With strict_writes: sensitive tools also need a `verified` attestation covering every claim.
+    require_verified: bool = False
+    # "human": a write that a quarantined reader's answer reached (through data or a condition) is always
+    # signed by a person, so steered classifications never act on their own. "policy": budget rules only.
+    reader_driven_writes: str = "human"
     approvers: dict[str, str] = field(default_factory=dict)
     tools: dict[str, ToolEffects] = field(default_factory=dict)
 
@@ -166,19 +193,43 @@ class Manifest:
                 idempotency_keys=bool(raw.get("idempotency_keys", False)),
                 conditional=conditional,
                 fencing=bool(raw.get("fencing", False)),
+                outcome_check=raw.get("outcome_check"),
+                confirm=raw.get("confirm"),
+                hold_seconds=float(raw.get("hold_seconds", 0)),
+                verified=raw.get("verified"),
+                undo_probe=raw.get("undo_probe"),
                 confirm_read_only=bool(raw.get("confirm_read_only", False)),
             )
         for name, eff in tools.items():
-            # Undo steps are retried (and re-sent by recovery), so repeating one must be harmless.
-            if eff.compensator is None:
-                continue
-            comp_name = eff.compensator.get("tool")
-            comp = tools.get(comp_name)
-            if comp is None:
-                raise ValueError(f"tool {name}: its compensator {comp_name!r} must be listed in the manifest")
-            if comp.state != "idempotent_write" and not comp.idempotency_keys:
-                raise ValueError(f"tool {name}: compensator {comp_name!r} is retried during rollback, so it must "
-                                 "be idempotent_write or declare \"idempotency_keys\": true")
+            check = eff.outcome_check
+            if check is not None:
+                if not isinstance(check, dict) or not isinstance(check.get("found"), str):
+                    raise ValueError(f"tool {name}: outcome_check needs \"tool\", \"args\" and \"found\"")
+                reader = tools.get(check.get("tool"))
+                if reader is None or reader.state != "read_only":
+                    raise ValueError(f"tool {name}: outcome_check tool {check.get('tool')!r} must be a listed "
+                                     "read_only tool")
+                parse_io_path(check["found"])
+            probe = eff.undo_probe
+            if probe is not None:
+                ptool = tools.get(probe.get("tool")) if isinstance(probe, dict) else None
+                if ptool is None or ptool.state != "read_only":
+                    raise ValueError(f"tool {name}: undo_probe must name a listed read_only tool")
+            if eff.confirm is not None and eff.state != "compensatable":
+                raise ValueError(f"tool {name}: only a compensatable tool can be a reservation with 'confirm'")
+            if eff.hold_seconds and eff.state != "irreversible":
+                raise ValueError(f"tool {name}: 'hold_seconds' only applies to irreversible tools")
+            # Undo and confirm steps are retried (and re-sent by recovery), so repeating one must be harmless.
+            for role, spec in (("compensator", eff.compensator), ("confirm", eff.confirm)):
+                if spec is None:
+                    continue
+                other_name = spec.get("tool") if isinstance(spec, dict) else None
+                other = tools.get(other_name)
+                if other is None:
+                    raise ValueError(f"tool {name}: its {role} {other_name!r} must be listed in the manifest")
+                if other.state != "idempotent_write" and not other.idempotency_keys:
+                    raise ValueError(f"tool {name}: {role} {other_name!r} is retried, so it must be "
+                                     "idempotent_write or declare \"idempotency_keys\": true")
         return cls(
             mode=data.get("mode", "enforce"),
             unlisted_tool_policy=defaults.get("unlisted_tool_policy", "reject"),
@@ -186,6 +237,9 @@ class Manifest:
             auto_approve_max_cost=float(approval.get("auto_approve_max_cost", 0)),
             approval_ttl_s=int(approval.get("ttl_seconds", 300)),
             strict_writes=bool(defaults.get("strict_writes", False)),
+            require_verified=bool(defaults.get("require_verified", False)),
+            reader_driven_writes=_choice(defaults.get("reader_driven_writes", "human"), ("human", "policy"),
+                                         "defaults.reader_driven_writes"),
             approvers=dict(approval.get("approvers", {})),
             tools=tools,
         )
@@ -196,6 +250,10 @@ class Manifest:
             defaults["max_plan_cost"] = self.max_plan_cost
         if self.strict_writes:
             defaults["strict_writes"] = True
+        if self.require_verified:
+            defaults["require_verified"] = True
+        if self.reader_driven_writes != "human":
+            defaults["reader_driven_writes"] = self.reader_driven_writes
         return {
             "version": "0.1",
             "mode": self.mode,
@@ -217,6 +275,26 @@ class Manifest:
         if self.unlisted_tool_policy == "infer":
             return infer_effects(tool, catalog, strict=True)
         return None
+
+
+def attestation_problems(eff: ToolEffects, contract_sha256: str) -> list[str]:
+    """Why a tool's `verified` attestation does not cover what the manifest claims (empty: it does)."""
+    v = eff.verified
+    if not v:
+        return ["not verified: run `planbound verify`"]
+    if v.get("contract_sha256") != contract_sha256:
+        return ["the tool changed since it was verified: run `planbound verify` again"]
+    checks = v.get("checks", {})
+    return [f"{name} is claimed but did not pass verification"
+            for name, claimed in (("idempotency_keys", eff.idempotency_keys), ("conditional", bool(eff.conditional)),
+                                  ("fencing", eff.fencing), ("outcome_check", bool(eff.outcome_check)))
+            if claimed and not checks.get(name)]
+
+
+def _choice(value: Any, allowed: tuple[str, ...], where: str) -> str:
+    if value not in allowed:
+        raise ValueError(f"{where} must be one of {allowed}, got {value!r}")
+    return value
 
 
 def canonical(value: Any) -> str:

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .approval import verify_approval
-from .compiler import CompiledPlan, CompileError, compile_plan
+from .compiler import READER_LABEL, CompiledPlan, CompileError, compile_plan
 from .manifest import (
     DEFAULT_CONFLICT_PATTERN,
     Manifest,
@@ -23,6 +23,7 @@ from .manifest import (
     parse_io_path,
 )
 from .plan import (
+    ID_RE,
     PENDING,
     SKIPPED,
     Ctx,
@@ -34,6 +35,7 @@ from .plan import (
     resolve,
     split_path,
 )
+from .script import ScriptError, is_script, parse_script
 from .store import Store
 from .summary import summarize
 
@@ -91,6 +93,10 @@ class SimulatedCrash(Exception):
     """Test hook: stands in for the gateway process dying mid-plan."""
 
 
+class PlanCancelled(Exception):
+    """Someone ran `planbound cancel` before the point of no return."""
+
+
 class LeaseLost(Exception):
     """Another gateway or `planbound recover` took this plan over: stop at once, touch nothing more."""
 
@@ -127,7 +133,10 @@ class Runtime:
         self.upstreams = upstreams
         self.manifest = manifest
         self.caller = caller or {}
-        self.reader = reader
+        # One reader, or several independent ones (different models or prompts) that must agree.
+        self.readers: list[QuarantineReader] = list(reader) if isinstance(reader, (list, tuple)) else (
+            [reader] if reader is not None else [])
+        self.reader = self.readers[0] if self.readers else None
         self.display_dir = Path(display_dir) if display_dir else Path(".planbound/display")
         self.retry_attempts = retry_attempts
         self.retry_delay_s = retry_delay_s
@@ -157,6 +166,16 @@ class Runtime:
                 "caller": rec["caller"], "plan_status": rec["status"], "skipped": h["data"] == SKIP_MARK}
 
     async def submit(self, raw: Any, mode: str = "execute", wait_seconds: float = 0) -> dict:
+        if is_script(raw):
+            try:
+                raw = parse_script(raw)
+            except ScriptError as e:
+                return e.to_json()
+        if _has_params(raw):
+            return {"status": "compile_error", "errors": [{
+                "code": "E_PARAM", "node_id": None, "path": "$",
+                "message": "This plan has param.* placeholders: prepare it with planbound_prepare, then run "
+                           "it with planbound_run."}]}
         try:
             compiled = self.compile(raw)
         except CompileError as e:
@@ -179,6 +198,48 @@ class Runtime:
                                     self.manifest.approval_ttl_s)
         self.store.update_plan(plan_id, status="awaiting_approval")
         return await self.commit(plan_id, wait_seconds=wait_seconds, _preview=preview)
+
+    # ---------------------------------------------------------------- prepared plans
+
+    async def prepare(self, name: str, raw: Any, example: dict) -> dict:
+        """Store a plan with param.* placeholders under a name, after checking it compiles with `example`.
+
+        Later runs send only the name and parameters: a few dozen output tokens instead of a whole plan.
+        Every run is still substituted, compiled, previewed and approved like any other plan."""
+        if is_script(raw):
+            try:
+                raw = parse_script(raw)
+            except ScriptError as e:
+                return e.to_json()
+        if not isinstance(name, str) or not ID_RE.match(name):
+            return {"status": "error", "message": "name must be lowercase letters, digits and _"}
+        names = sorted(_param_names(raw))
+        if set(example) != set(names):
+            return {"status": "error", "message": f"example must give exactly the params {names}"}
+        bad = [k for k, v in example.items() if not isinstance(v, (str, int, float, bool))]
+        if bad:
+            return {"status": "error", "message": f"params must be strings, numbers or booleans: {bad}"}
+        try:
+            compiled = self.compile(_bind(raw, example))
+        except CompileError as e:
+            return e.to_json()
+        params = {k: type(v).__name__ for k, v in example.items()}
+        self.store.put_prepared(name, self.caller, raw, params)
+        return {"status": "prepared", "name": name, "params": params, "worst_case": compiled.worst_case}
+
+    async def run_prepared(self, name: str, params: dict, mode: str = "execute", wait_seconds: float = 0) -> dict:
+        prepared = self.store.get_prepared(name, self.caller)
+        if prepared is None:
+            return {"status": "error", "message": f"no prepared plan {name!r}",
+                    "prepared": sorted(self.store.list_prepared(self.caller))}
+        want = prepared["params"]
+        if set(params) != set(want):
+            return {"status": "error", "message": f"{name} takes exactly {sorted(want)}"}
+        wrong = [k for k, v in params.items() if type(v).__name__ != want[k]
+                 and not (want[k] == "float" and type(v) is int)]
+        if wrong:
+            return {"status": "error", "message": f"wrong types for {wrong}; expected {want}"}
+        return await self.submit(_bind(prepared["raw"], params), mode=mode, wait_seconds=wait_seconds)
 
     async def commit(self, plan_id: str, wait_seconds: float = 0, _preview: dict | None = None) -> dict:
         rec = self.store.get_plan(plan_id)
@@ -356,7 +417,9 @@ class Runtime:
                 if ni.effects.cost and per is not None:
                     cost += n * per
         write_nodes = [n for n in c.order if c.info[n].kind == "write" and n not in run.skipped]
-        requires_human = any(c.info[n].effects.requires_approval for n in write_nodes)
+        reader_driven = [n for n in write_nodes if READER_LABEL in c.info[n].labels]
+        requires_human = any(c.info[n].effects.requires_approval for n in write_nodes) or (
+            bool(reader_driven) and self.manifest.reader_driven_writes == "human")
         if not write_nodes:
             approval = "none"
         elif not requires_human and cost <= self.manifest.auto_approve_max_cost:
@@ -375,6 +438,7 @@ class Runtime:
             "skipped": run.skipped,
             "approval": approval,
             "requires_human": requires_human,
+            "reader_driven": reader_driven,
             "summaries": {nid: self._summary(run, nid) for nid in c.order if nid in c.read_frontier},
             "warnings": c.warnings,
         }
@@ -491,6 +555,12 @@ class Runtime:
             return {"status": "stale", "plan_id": plan_id, "code": "E_PREVIEW_STALE",
                     "message": "The data changed since the preview, so the approved writes no longer match. "
                                "Nothing was written. Submit the plan again for a fresh preview."}
+        unavailable = await self._preflight(compiled)
+        if unavailable:
+            # Nothing written and nothing claimed: the plan can simply be committed again later.
+            return {"status": "deferred", "plan_id": plan_id, "unavailable": unavailable,
+                    "message": "A service this plan would need to undo or confirm its steps is unavailable, "
+                               "so it did not start. Nothing was written. Commit it again later."}
         if not self.store.claim(plan_id, self.instance_id, self.lease_ttl_s, ("awaiting_approval", "previewed"),
                                 new_status="running"):
             rec = self.store.get_plan(plan_id)
@@ -523,11 +593,50 @@ class Runtime:
                 failure = first if isinstance(first, NodeFailure) else NodeFailure("?", repr(first))
                 break
         if failure is None:
-            result = self._result(run, "completed")
+            # Every step ran: the plan is past its point of no return. Confirm the reservations it holds.
+            self.store.update_plan(run.plan_id, phase="confirm")
+            conf = await self._confirm(run.plan_id, c)
+            result = self._result(run, "completed") if conf["ok"] else self._result(
+                run, "failed_partial", note="Every step ran, but some reservations are not confirmed yet. "
+                                            "`planbound recover` keeps confirming them.")
+            if conf["confirmed"] or conf["failed"]:
+                result["confirmation"] = conf
         else:
             result = await self._settle(run.plan_id, run=run, failure=failure)
         self.store.update_plan(run.plan_id, status=result["status"], result=result)
         return result
+
+    async def _confirm(self, plan_id: str, compiled: CompiledPlan) -> dict:
+        """Turn held reservations into real effects. Retried; only ever moves forward."""
+        done, failed = 0, []
+        for e in self.store.journal(plan_id):
+            eff = compiled.info[e["node_id"]].effects if e["node_id"] in compiled.info else None
+            if e["status"] != "COMPLETED" or eff is None or not eff.confirm:
+                continue
+            fence = self._fence(plan_id)
+            error: str | None = None
+            for attempt in range(self.compensation_attempts):
+                try:
+                    tool, args = _io_call(eff.confirm, e["args"], e["result"])
+                    await self.upstreams.call(tool, args, {**fence, IDEM_META: e["idem_key"] + ":confirm"})
+                    error = None
+                    break
+                except (SimulatedCrash, LeaseLost):
+                    raise
+                except UpstreamError as ex:
+                    _raise_if_fenced(ex, plan_id)
+                    error = str(ex)
+                except Exception as ex:  # noqa: BLE001 - e.g. no result to confirm from; recorded below
+                    error = str(ex)
+                    break
+                if attempt + 1 < self.compensation_attempts:
+                    await asyncio.sleep(self.retry_delay_s * 2 ** attempt)
+            if error is None:
+                self._jset(e["seq"], "CONFIRMED")
+                done += 1
+            else:
+                failed.append({"step": _step(e), "error": error})
+        return {"ok": not failed, "confirmed": done, "failed": failed}
 
     async def _settle(self, plan_id: str, *, run: Run | None = None, failure: NodeFailure | None = None) -> dict:
         """Decide what a plan that stopped early needs, from the journal alone, and do what is safe."""
@@ -535,8 +644,10 @@ class Runtime:
         unknown = [_step(e) for e in journal if e["status"] == "UNKNOWN"]
         # Past the point of no return once something that cannot be undone has happened: the pivot, or a
         # retry-safe step (those are not undone, so the plan can only go forward).
-        passed = any(e["state"] in ("irreversible", "idempotent_write") and e["status"] == "COMPLETED"
-                     for e in journal)
+        rec = self.store.get_plan(plan_id)
+        passed = rec["phase"] == "confirm" or any(
+            (e["state"] in ("irreversible", "idempotent_write") and e["status"] == "COMPLETED")
+            or e["status"] == "CONFIRMED" for e in journal)
         pivot_unknown = any(e["state"] == "irreversible" and e["status"] == "UNKNOWN" for e in journal)
 
         def out(status: str, **kw) -> dict:
@@ -556,6 +667,9 @@ class Runtime:
                            note="Undoable steps that are known to have happened were compensated. The unknown "
                                 "steps may still have happened: check each upstream, record it with "
                                 "`planbound resolve`, then run `planbound recover`.")
+            if failure is not None and failure.code == "E_CANCELLED" and comp["ok"]:
+                return out("cancelled", compensation=comp, note="Cancelled before the point of no return; "
+                                                               "every step that ran was undone.")
             if run is None:
                 return out("recovered_compensated" if comp["ok"] else "failed_partial", compensation=comp)
             return out("failed_compensated" if comp["ok"] else "failed_partial", compensation=comp,
@@ -617,6 +731,8 @@ class Runtime:
         except Pending:
             run.outputs[nid] = PENDING
             return
+        except PlanCancelled as e:
+            raise NodeFailure(nid, str(e), code="E_CANCELLED") from e
         except WriteConflict as e:
             raise NodeFailure(nid, str(e), code="E_WRITE_CONFLICT") from e
         except OutcomeUnknown as e:
@@ -635,6 +751,10 @@ class Runtime:
             raise SimulatedCrash("gateway already crashed")
         if ni.kind != "write":
             return await self.upstreams.call(ni.tool, args)
+        if eff.state == "irreversible" and eff.hold_seconds:
+            await self._hold(run.plan_id, eff.hold_seconds)
+        if not run.pivot_done and self.store.cancel_requested(run.plan_id):
+            raise PlanCancelled(f"{run.plan_id} was cancelled")
         fence = self._fence(run.plan_id)
         key = f"{run.plan_id}:{ni.node.id}:{idx}"
         prior = self.store.journal_find(key)
@@ -677,8 +797,14 @@ class Runtime:
         if not ok:
             assert last is not None
             if not last.definite:
-                self._jset(seq, "UNKNOWN", error=str(last))
-                raise OutcomeUnknown(f"{ni.tool} got no answer, so it may or may not have happened: {last}")
+                verdict, found = await self._check_outcome(eff, args)
+                if verdict == "happened":
+                    result, ok = found, True  # the upstream says it went through: carry on
+                else:
+                    self._jset(seq, "UNKNOWN", error=str(last))
+                    raise OutcomeUnknown(f"{ni.tool} got no answer, so it may or may not have happened: {last}")
+        if not ok:
+            assert last is not None
             self._jset(seq, "FAILED", error=str(last))
             if conflict and conflict.search(str(last)):
                 raise WriteConflict(f"{ni.tool} refused: the data changed after the commit re-read ({last})")
@@ -689,6 +815,49 @@ class Runtime:
             raise SimulatedCrash(f"crash after {self._writes_done} writes")
         self._jset(seq, "COMPLETED", result=result)
         return result
+
+    async def _preflight(self, compiled: CompiledPlan) -> list[dict]:
+        """Before any write: are the services the undo and confirm steps need reachable right now?"""
+        probes = {}
+        for nid in compiled.order:
+            eff = compiled.info[nid].effects
+            if compiled.info[nid].kind == "write" and eff.undo_probe:
+                probes[canonical(eff.undo_probe)] = eff.undo_probe
+        failed = []
+        for probe in probes.values():
+            try:
+                await self.upstreams.call(probe["tool"], probe.get("args", {}))
+            except Exception as e:  # noqa: BLE001 - any failure means: do not start
+                failed.append({"probe": probe["tool"], "error": str(e)})
+        return failed
+
+    async def _hold(self, plan_id: str, seconds: float) -> None:
+        """The cancel window before a point of no return: wait, keep the lease, stop if cancelled."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if self.store.cancel_requested(plan_id):
+                raise PlanCancelled(f"{plan_id} was cancelled during its hold")
+            self._fence(plan_id)  # renew the lease while waiting
+            await asyncio.sleep(min(0.05, max(0.0, deadline - time.time())))
+
+    def cancel(self, plan_id: str) -> dict:
+        """Stop a plan before its point of no return. Waiting plans are dropped; running ones roll back
+        at their next step (and at once if they are in a hold window)."""
+        rec = self.store.get_plan(plan_id)
+        if rec is None:
+            return {"status": "error", "message": f"unknown plan {plan_id}"}
+        if rec["status"] in ("previewed", "awaiting_approval", "compiled"):
+            self.store.update_plan(plan_id, status="cancelled", result={"status": "cancelled"})
+            return {"status": "cancelled", "plan_id": plan_id, "message": "Nothing was written."}
+        if rec["status"] != "running":
+            return {"status": "error", "message": f"plan {plan_id} is {rec['status']}; nothing to cancel"}
+        journal = self.store.journal(plan_id)
+        if rec["phase"] == "confirm" or any(e["state"] == "irreversible" and e["status"] in ("COMPLETED", "IN_FLIGHT")
+                                            for e in journal):
+            return {"status": "error", "message": "too late: the point of no return has passed"}
+        self.store.request_cancel(plan_id)
+        return {"status": "cancel_requested", "plan_id": plan_id,
+                "message": "The plan rolls back at its next step."}
 
     def _fence(self, plan_id: str) -> dict:
         """Renew our lease and return the fencing token to send with a write."""
@@ -701,6 +870,35 @@ class Runtime:
         if not self.store.journal_set(seq, status, owner=self.instance_id, **kw):
             raise LeaseLost("lost the plan's lease; the journal belongs to its new holder")
 
+    async def _check_outcome(self, eff: ToolEffects, args: dict, result: Any = None) -> tuple[str, Any]:
+        """Ask the upstream whether a write happened: ("happened", result), ("absent", None) or ("unknown", None)."""
+        check = eff.outcome_check
+        if not check:
+            return "unknown", None
+        try:
+            tool, call_args = _io_call(check, args, result)
+            answer = await self.upstreams.call(tool, call_args)
+            _, segs = parse_io_path(check["found"])
+            found = get_path(answer, segs)
+        except Exception:  # noqa: BLE001 - a failed lookup proves nothing either way
+            return "unknown", None
+        if found in (None, [], {}, ""):
+            return "absent", None
+        return "happened", found[0] if isinstance(found, list) else found
+
+    async def _settle_unknown(self, plan_id: str, compiled: CompiledPlan) -> None:
+        """Turn UNKNOWN writes into known ones where the upstream can say what happened."""
+        for e in self.store.journal(plan_id):
+            if e["status"] != "UNKNOWN":
+                continue
+            eff = compiled.info[e["node_id"]].effects
+            verdict, found = await self._check_outcome(eff, e["args"])
+            if verdict == "happened":
+                self._jset(e["seq"], "COMPLETED", result=found, error=None)
+            elif verdict == "absent" and time.time() - e["updated_at"] >= eff.outcome_check.get("settle_seconds", 30):
+                # Absent for longer than a late request could still be in flight: it never happened.
+                self._jset(e["seq"], "FAILED", error="outcome check: the upstream has no record of it")
+
     async def _compensate(self, plan_id: str) -> dict:
         """Undo completed compensatable writes, newest first. Each undo is retried; failures are recorded
         (COMPENSATION_FAILED) and retried again by the next `recover`."""
@@ -712,7 +910,7 @@ class Runtime:
             error: str | None = None
             for attempt in range(self.compensation_attempts):
                 try:
-                    tool, args = _compensator_call(e)
+                    tool, args = _io_call(e["compensator"], e["args"], e["result"])
                 except Exception as ex:  # noqa: BLE001 - e.g. no recorded result to undo from: not retryable
                     error = f"cannot build the undo call: {ex}"
                     break
@@ -761,6 +959,7 @@ class Runtime:
                     self._jset(e["seq"], "FAILED" if ex.definite else "UNKNOWN", error=str(ex))
             else:
                 self._jset(e["seq"], "UNKNOWN", error="crashed during the call; outcome unknown")
+        await self._settle_unknown(plan_id, compiled)
         result = await self._settle(plan_id)
         if result["status"] == "failed_partial" and "compensation" not in result:
             # Past the point of no return with nothing unknown: roll forward.
@@ -796,9 +995,26 @@ class Runtime:
             text = text if isinstance(text, str) else json.dumps(text)
             key = hashlib.sha256((canonical(schema) + text).encode()).hexdigest()
             if key not in self._reader_cache:
-                self._reader_cache[key] = _validate_extraction(await self.reader.extract(text, schema), schema)
+                self._reader_cache[key] = await self._agreed_reading(node, text, schema)
             out.append({**item, **self._reader_cache[key]} if isinstance(item, dict) else self._reader_cache[key])
         return out[0:1] if single else out
+
+    async def _agreed_reading(self, node, text: str, schema: dict) -> dict:
+        """Every reader classifies independently. A field they disagree on takes the node's `fallback`
+        value, or fails the plan: one steered reader cannot decide alone."""
+        answers = await asyncio.gather(*(r.extract(text, schema) for r in self.readers))
+        valid = [_validate_extraction(a, schema) for a in answers]
+        out = {}
+        fallback = node.raw.get("fallback") or {}
+        for name in schema:
+            values = {json.dumps(v[name]) for v in valid}
+            if len(values) == 1:
+                out[name] = valid[0][name]
+            elif name in fallback:
+                out[name] = fallback[name]
+            else:
+                raise EvalError(f"quarantined readers disagree on {name!r}; add a 'fallback' value for it")
+        return out
 
     def _display(self, run: Run, nid: str, data: Any) -> dict:
         self.display_dir.mkdir(parents=True, exist_ok=True)
@@ -813,12 +1029,10 @@ class Runtime:
             return {"handle": f"h://{run.plan_id}/{nid}", "skipped": True}
         if value is PENDING:
             return {"handle": f"h://{run.plan_id}/{nid}", "pending": True}
-        return {
-            "handle": f"h://{run.plan_id}/{nid}",
-            "source_tool": ni.tool,
-            "labels": sorted(ni.labels),
-            "summary": summarize(value, trusted=ni.trust == "trusted"),
-        }
+        out = {"handle": f"h://{run.plan_id}/{nid}", "summary": summarize(value, trusted=ni.trust == "trusted")}
+        if ni.labels:
+            out["labels"] = sorted(ni.labels)
+        return out
 
     def _result(self, run: Run, status: str, *, failure: NodeFailure | None = None,
                 compensation: dict | None = None, note: str | None = None,
@@ -867,6 +1081,31 @@ def _waves_of(nodes: list[str], deps: dict[str, set[str]], done: set[str]) -> li
     return waves
 
 
+def _param_names(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        if set(value) == {"$param"}:
+            return {value["$param"]}
+        return set().union(*(_param_names(v) for v in value.values())) if value else set()
+    if isinstance(value, list):
+        return set().union(*(_param_names(v) for v in value)) if value else set()
+    return set()
+
+
+def _has_params(value: Any) -> bool:
+    return bool(_param_names(value))
+
+
+def _bind(value: Any, params: dict) -> Any:
+    """Replace every {"$param": name} with its value: the result is an ordinary plan."""
+    if isinstance(value, dict):
+        if set(value) == {"$param"}:
+            return params[value["$param"]]
+        return {k: _bind(v, params) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_bind(v, params) for v in value]
+    return value
+
+
 def _raise_if_fenced(error: Exception, plan_id: str) -> None:
     if FENCING_REJECTED in str(error):
         raise LeaseLost(f"an upstream refused our fencing token: {plan_id} has a newer holder") from error
@@ -876,16 +1115,16 @@ def _step(entry: dict) -> str:
     return f"{entry['node_id']}[{entry['item_index']}]"
 
 
-def _compensator_call(entry: dict) -> tuple[str, dict]:
-    comp = entry["compensator"]
+def _io_call(spec: dict, inputs: dict, output: Any) -> tuple[str, dict]:
+    """Build a follow-up call (undo, confirm, outcome check) from a write's input and output."""
     args = {}
-    for name, spec in comp.get("args", {}).items():
-        if isinstance(spec, str) and spec.startswith("$"):
-            source, segs = parse_io_path(spec)
-            args[name] = get_path(entry["args"] if source == "input" else entry["result"], segs)
+    for name, value in spec.get("args", {}).items():
+        if isinstance(value, str) and value.startswith("$"):
+            source, segs = parse_io_path(value)
+            args[name] = get_path(inputs if source == "input" else output, segs)
         else:
-            args[name] = spec
-    return comp["tool"], args
+            args[name] = value
+    return spec["tool"], args
 
 
 def _validate_extraction(data: dict, schema: dict) -> dict:

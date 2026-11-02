@@ -69,11 +69,30 @@ Owned by the operator. Server annotations are hints; only this file is trusted (
 | `conditional` | `{"arg": "expected_version", "conflict_pattern"?: "<regex>"}`: the upstream refuses the write if `arg` no longer matches. The plan must fill `arg` from a read (`$ref`/`$item`), else `E_CONDITIONAL_REQUIRED`; a refusal matching the pattern fails the step with `E_WRITE_CONFLICT` and the plan rolls back |
 | `compensator` | The undo call. Its tool must be listed and be `idempotent_write` or declare `idempotency_keys: true`, because rollback retries it; otherwise the manifest does not load |
 | `fencing` | The operator confirms the upstream checks `io.planbound/fencing-token` (`{"plan", "epoch"}`): it remembers the highest epoch seen per plan and refuses lower ones with an error containing `io.planbound/fencing-token rejected` |
+| `confirm` | Makes a compensatable tool a **reservation** (try / confirm / cancel): the write only holds the effect, invisible to others; `confirm` (`{"tool", "args"}`, retry-safe) makes it real once the plan is past its point of no return; the compensator cancels the hold. A plan that fails before then was never visible to anyone |
+| `hold_seconds` | Irreversible tools: a cancel window before sending. `planbound cancel` (or the agent's `planbound_cancel`) during it rolls the plan back → `cancelled` |
+| `outcome_check` | `{"tool": <read_only>, "args", "found": "$output.<path>", "settle_seconds"?: 30}`: how to ask the upstream whether a write whose answer was lost happened. Found → `COMPLETED` with that result; absent for `settle_seconds` → `FAILED`. Lost answers then need no person |
+| `undo_probe` | `{"tool": <read_only>, "args"}`: a cheap call to the service the undo and confirm steps need. If it fails at commit, the plan does not start (`deferred`, nothing written) and can be committed later |
+| `verified` | The attestation `planbound verify` printed for this tool (see below) |
 | `confirm_read_only` | Needed to mark a tool `read_only` when its name says it writes (`refund_`, `send_`, `delete_`, …); otherwise the manifest does not load |
 
 **`defaults.strict_writes`.** When true, every *sensitive* write (one with a `cost` or
 `requires_approval`) must declare `idempotency_keys: true`, `conditional` and `fencing: true`, or the
 plan fails with `E_UNSAFE_WRITE`. Turn it on for anything that moves money.
+
+**`planbound verify <tool> --args '<sample>'`** tests every guarantee the manifest claims for a write,
+against a sandbox, and undoes each probe with the compensator: the same idempotency key twice must
+give the same result; a wrong conditional value must be refused with a conflict; an older fencing
+epoch must be refused; the `outcome_check` must find the probe write. It prints an attestation bound
+to the tool's contract hash. With `defaults.require_verified` (and `strict_writes`), sensitive tools
+need a passing attestation for every claim, or the plan fails with `E_UNVERIFIED`.
+
+**Reader-driven writes.** Everything a quarantined reader decided carries the provenance label
+`reader_derived`, through data and through `when`/`where` conditions. A write it reaches always
+goes to a human signer (`defaults.reader_driven_writes: "human"`, the default; `"policy"` uses budget
+rules only). The label never blocks data flow. A gateway can run several independent readers
+(different models or prompts): every field must agree, else the node's `fallback` value is used, or
+the plan stops.
 
 **Hint conflicts.** A tool the manifest calls `read_only` but the server annotates `destructiveHint`
 is refused with `E_EFFECTS_CONFLICT`.
@@ -101,6 +120,22 @@ anything else → `irreversible`), results are marked unverified, and tool usage
 | `quarantine_read` | `input`, `field`, `max_items`, `schema` of closed types | items plus the extracted fields |
 | `display` | `input` | data is written for the human; the model sees only a receipt |
 | `checkpoint` | `handle` (`h://plan/node` from an earlier plan's summary), `max_age_seconds`? | that saved result, as if read again: same labels and trust, field checks against its data |
+
+**Plan scripts.** The same plan can be sent as a script, which is shorter to write: a subset of
+Python syntax parsed with `ast` and never executed (`planbound/script.py`). Each statement is
+`step = server.tool(arg=value, when=cond, after=[steps])` or `step = filter|partition|map|
+quarantine_read|display|checkpoint(...)`; values are literals, `step.path`, `item.field`,
+`caller.attr`, `param.name` and `count|sum|...(step, "field")`; conditions use Python comparison
+and boolean operators; `return a, b` sets `return`; a leading `# goal:` comment sets the goal. It
+translates one-to-one into the JSON plan, so every compiler check applies; anything outside the
+subset is an `E_SCRIPT` error with its line.
+
+**Prepared plans.** `planbound_prepare(name, script|plan, example)` stores a plan with `param.*`
+placeholders for the caller, after checking it compiles with the example values;
+`planbound_run(name, params)` binds the params (exact names and types) and submits the result as an
+ordinary plan: compiled, previewed, approved and journaled like any other. Plans with unbound
+placeholders cannot be submitted directly (`E_PARAM`). The tool index lists the caller's prepared
+plans.
 
 **Values:** literals, `{"$ref": "node.a.b"}`, `{"$item": "field"}` (map args, `where`),
 `{"$agg": {"fn": "count|distinct_count|sum|min|max|mean", "of": "node.path", "field": "f", "default": d}}`,
@@ -131,7 +166,8 @@ All errors come back together with `code`, `node_id`, JSON `path`, `message` and
 `E_IDENTITY` `E_LABEL_FLOW` `E_WHEN_ON_WRITE` `E_MULTIPLE_PIVOTS` `E_IRREVERSIBLE_NOT_TERMINAL`
 `E_SAGA_ORDER` `E_COST_BOUND` (suggests a smaller `max_items`) `E_CONDITIONAL_REQUIRED`
 `E_UNSAFE_WRITE` `E_EFFECTS_CONFLICT` `E_UNKNOWN_HANDLE` `E_HANDLE_CALLER` `E_HANDLE_UNUSABLE`
-`E_HANDLE_EXPIRED`.
+`E_HANDLE_EXPIRED` `E_UNVERIFIED`. Runtime failure codes: `E_WRITE_CONFLICT` `E_OUTCOME_UNKNOWN`
+`E_CANCELLED`.
 
 **Saga shape** (enforced here, not hoped for at runtime):
 `compensatable steps → at most one irreversible pivot → idempotent_write steps`.
@@ -215,6 +251,11 @@ is rejected; a second irreversible step needs `allow_partial_irreversible`.
 
 Unknown options and out-of-range values stop the gateway from starting.
 
+**Gateway config `alerts` section** (optional): `{"command": ["program", "arg", ...], "after_seconds": 300}`.
+When a plan stays `failed_partial` or `needs_attention` that long, the background reconciler (and
+`recover --watch`) runs the command once for it, with the plan as JSON on stdin. A non-zero exit is
+retried on the next pass.
+
 ---
 
 ## 5. What the model sees
@@ -227,28 +268,24 @@ views under the same rules. Trusted sources and `display` receipts are the only 
 
 ---
 
-## 6. Limits that remain
+## 6. Limits, and how each is handled
 
-Each of these is a property of the problem, not a missing feature. They are stated so nobody relies
-on a guarantee Planbound cannot give.
+Some limits come from coordinating independent systems and cannot be removed by any gateway. Each
+one has a defence that either prevents the bad case or makes sure it is caught.
 
-- **Saga semantics, not ACID.** Independent systems have no shared transaction, so others can see a
-  refund before it is compensated, and an email cannot be unsent. Planbound orders the steps so at
-  most one irreversible step exists and it runs last.
-- **Upstream guarantees are claims.** Idempotency keys, conditional writes and fencing tokens only
-  help if the server really honours them. `strict_writes` makes Planbound refuse sensitive tools whose
-  operator has not confirmed them; it cannot audit the server.
-- **A rollback waits for the service it needs.** Undo steps are retried, and with
-  `reconcile_seconds` they are retried forever in the background, so a rollback finishes as soon as
-  the service is back. Until then the plan is honestly `failed_partial`.
-- **A lost answer without idempotency keys needs a person.** Nothing can tell whether such a write
-  happened except the upstream itself; Planbound reports it (`needs_attention`) and never guesses.
-- **Classification can be steered.** A quarantined reader returns only closed types, so injected text
-  cannot add actions, but a crafted text can still pick a wrong category. Bounds and budgets stay.
-- **The manifest is trusted.** Load-time and hint checks catch obvious mislabels, not a write tool
-  with a read-like name and no annotations.
-- **Approval channel.** The gateway only holds public keys, but the policy signer and the human
-  must run where the agent cannot reach their private keys.
+| Limit | Why it cannot be removed | How Planbound handles it |
+|---|---|---|
+| A sent email cannot be unsent; others can see a refund before it is undone | Independent systems share no transaction | **Reservations** (`confirm`): undoable effects are held invisibly and confirmed only past the point of no return, so a failure before then was never visible. **Cancel window** (`hold_seconds`) before irreversible steps. At most one irreversible step, always last |
+| An upstream may claim guarantees it does not honour | Planbound cannot inspect a server's code | **`planbound verify`** tests each claim and produces an attestation; `require_verified` refuses sensitive tools without a passing, current one. Retries, re-sends and recovery rely only on what was verified |
+| A lost answer without deduplication: only the server knows whether it happened | The request may have landed, or still be in flight | **`outcome_check`**: Planbound asks the server, settles found writes at once and absent ones after `settle_seconds`. Only a server with no way to ask needs a person (`needs_attention`, `resolve`) |
+| A rollback cannot finish while the service it needs is down | An undo is itself a call to that service | **`undo_probe`**: a plan does not start while its undo service is unreachable. **Background reconciliation** finishes rollbacks when it is back. **Alerts** (`alerts.command`) after `after_seconds` stuck, once per plan; `planbound stuck` lists them |
+| Injected text can steer a quarantined reader within its closed answers | A classifier reading attacker text can be fooled | **Several independent readers** must agree, else a `fallback` value or a stop. **Reader-driven writes always need a human signer.** Closed types, bounds and budgets stay |
+
+Still true and stated plainly:
+- **The manifest is trusted.** Load-time checks, hint conflicts and `verify` catch mislabels and false
+  claims; an operator can still describe a tool's effects wrongly in ways no test reveals.
+- **Approval channel.** The gateway only holds public keys; the policy signer and the human must run
+  where the agent cannot reach their private keys.
 - **Identity comes from the host.** The caller comes from config or `PLANBOUND_CALLER`.
-- **Plans cost more output tokens than a code-mode script** (see `bench/RESULTS.md`); the safety
-  checks are paid for in a JSON plan instead of a short script.
+- **Cost.** A script plan costs about what a code-mode script costs (see `bench/RESULTS.md`); a JSON
+  plan costs about twice the output, and a prepared plan a fraction of either.

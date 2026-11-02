@@ -11,7 +11,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .manifest import Manifest, ToolEffects, UpstreamTool, canonical
+from .manifest import (
+    Manifest,
+    ToolEffects,
+    UpstreamTool,
+    attestation_problems,
+    canonical,
+)
 from .plan import (
     AGG_FNS,
     ID_RE,
@@ -31,6 +37,9 @@ from .plan import (
 
 SUPPORTED_VERSION = "0.1"
 QUARANTINE_TYPES = ("boolean", "integer", "number")
+# Provenance label on everything a quarantined reader decided, and everything computed from it. It is
+# not a data-flow restriction (any tool may receive it); it sends writes it reaches to a human.
+READER_LABEL = "reader_derived"
 HANDLE_RE = re.compile(r"^h://(p_[0-9a-f]+)/([a-z][a-z0-9_]{0,31})$")
 # Plans whose saved results may seed a later plan: completed ones, and ones that never wrote anything
 # (every handle they hold is a real read).
@@ -342,6 +351,13 @@ def compile_plan(
                     f"declare {' or '.join(missing)} for it.",
                     "The operator must confirm the upstream supports them (idempotency_keys, conditional, "
                     "fencing) or turn off defaults.strict_writes.")
+            elif manifest.require_verified:
+                problems = attestation_problems(eff, tool.contract_sha256())
+                if problems:
+                    err("E_UNVERIFIED", node, args_suffix.replace(".args", ".tool"),
+                        f"{tool_name!r}: " + "; ".join(problems) + ".",
+                        f"Run `planbound verify {tool_name} --args '<sample args>'` against a sandbox and add "
+                        "the attestation to the manifest as \"verified\".")
 
     if diags:
         raise CompileError(diags)
@@ -401,13 +417,21 @@ def compile_plan(
                     incoming |= info[root].labels
         if ni.checkpoint is not None:
             continue  # labels and trust come with the saved result
+        for cond in node_conditions(ni.node).values():  # a write gated on a reader's answer is driven by it
+            for kind, v in walk_condition(cond):
+                root = ref_root(kind, v)
+                if root and READER_LABEL in info[root].labels:
+                    incoming.add(READER_LABEL)
+        if ni.node.op == "quarantine_read":
+            incoming.add(READER_LABEL)
         if ni.effects:
             ok = True
+            restricted = incoming - {READER_LABEL}
             if ni.effects.allowed_input_labels is not None:
-                bad = incoming - set(ni.effects.allowed_input_labels)
+                bad = restricted - set(ni.effects.allowed_input_labels)
                 ok = not bad
             elif ni.effects.egress == "external":
-                bad = incoming
+                bad = restricted
                 ok = not bad
             if not ok:
                 err("E_LABEL_FLOW", ni.node, "",
@@ -509,6 +533,21 @@ def _check_quarantine_schema(node: Node, err) -> None:
             err("E_QUARANTINE_SCHEMA", node, f".schema.{name}",
                 f"Field {name!r} must be a closed type: an enum of short strings, boolean, integer or number.",
                 "Free text from a quarantined reader would reopen the prompt-injection channel.")
+    fallback = node.raw.get("fallback")
+    if fallback is not None:
+        if not isinstance(fallback, dict):
+            err("E_QUARANTINE_SCHEMA", node, ".fallback", "'fallback' maps schema fields to closed values.")
+            return
+        for name, value in fallback.items():
+            spec = schema.get(name) if isinstance(schema, dict) else None
+            kinds = {"boolean": (bool,), "integer": (int,), "number": (int, float)}
+            ok = isinstance(spec, dict) and (
+                value in spec["enum"] if "enum" in spec else
+                isinstance(value, kinds.get(spec.get("type"), ())) and
+                (spec.get("type") == "boolean" or not isinstance(value, bool)))
+            if not ok:
+                err("E_QUARANTINE_SCHEMA", node, f".fallback.{name}",
+                    f"fallback {name!r} must be a valid value of the schema field {name!r}.")
 
 
 def _check_args(node: Node, suffix: str, args: dict, tool: UpstreamTool, err) -> None:

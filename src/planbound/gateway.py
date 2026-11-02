@@ -19,30 +19,28 @@ from .store import Store
 from .upstream import MCPUpstreams
 
 PLAN_GUIDE = """\
-Planbound runs your tool calls as one bounded plan. Instead of calling tools one by one,
-send a plan to planbound_submit_plan. You get back summaries computed by code (counts, sums,
-ids), never raw text, plus handles (h://plan/node) to the full data.
+Planbound runs your tool calls as one bounded plan. Send it to planbound_submit_plan as a script
+(compact Python-like syntax, only parsed, never run). You get summaries computed by code, never raw
+text, and handles (h://plan/node) to the full data.
 
-Plan: {"planbound": "0.1", "goal": "...", "nodes": [...], "return": ["node", ...]}
-Nodes (each has a unique "id", lowercase):
-  {"id","op":"call","tool":"server.tool","args":{...},"when"?:cond,"depends_on"?:[ids]}
-  {"id","op":"filter","input":{"$ref":"node.path"},"where":cond}
-  {"id","op":"partition","input":{"$ref":...},"where":cond}   -> output {"match":[...],"rest":[...]}
-  {"id","op":"map","input":{"$ref":...},"max_items":N,"call":{"tool":...,"args":{...}}}
-  {"id","op":"quarantine_read","input":{"$ref":...},"field":"text_field","max_items":N,
-   "schema":{"name":{"enum":[...]} | {"type":"boolean"|"integer"|"number"}}}
-  {"id","op":"display","input":{"$ref":...}}   shows data to the human only, never to you
-  {"id","op":"checkpoint","handle":"h://plan/node","max_age_seconds"?:N}
-      continue from a result an earlier plan of yours returned: use it like a read, without reading again.
-      Investigate in stages: run a read-only plan, look at the summaries, then send the next plan.
-Values: literals, {"$ref":"node.a.b"}, {"$item":"field"} (inside map args / where),
-  {"$agg":{"fn":"count|distinct_count|sum|min|max|mean","of":"node.path","field":"f"}},
-  {"$caller":"attr"} (the signed-in user; required where a tool acts on "your own" record).
-Conditions: {"eq"|"ne"|"gt"|"gte"|"lt"|"lte":[a,b]}, {"in":[a,list]}, {"and":[...]}, {"or":[...]},
-  {"not":c}, {"exists":a}. "when" may only use data that is known before any write.
-Rules: every map needs max_items; no loops; at most one irreversible step and it runs after
-every undoable step; errors come back with a code, the JSON path and a hint, so fix and resend.
-Modes: "compile" (check only), "preview" (run reads, show exact impact), "execute" (default).
+  # goal: what this does
+  cust = crm.get_customer(customer_id="C-42")
+  late = filter(orders.orders, item.amount < 5000 and item.id not in disputes.ids)
+  done = map(late, billing.refund(order_id=item.id), max_items=20)       # every map needs max_items
+  note = email.send(to=cust.email, vars={"n": count(late), "sum": sum(late, "amount")},
+                    when=count(late) > 0, after=[done])
+  return late, done
+
+Steps: server.tool(name=value, when=cond, after=[steps]); filter(x, cond); partition(x, cond)
+-> .match/.rest; map(x, server.tool(...), max_items=N); quarantine_read(x, field="text",
+max_items=N, schema={"f": {"enum": [...]}|{"type": "boolean"|"integer"|"number"}}); display(x)
+(human sees it, you don't); checkpoint("h://plan/node") (continue from an earlier result).
+Values: literals, step.path, item.field, caller.attr, count|distinct_count|sum|min|max|mean(step, "field").
+Conditions: < <= > >= == != in, not in, and, or, not, exists(x). No loops; `when` may only use reads.
+At most one irreversible step, after every undoable one. Errors name the line and how to fix it.
+Modes: "compile", "preview" (exact impact, nothing written), "execute" (default).
+Repeated task? planbound_prepare(name, script with param.x placeholders, example), then
+planbound_run(name, params): a few tokens per run, same checks.
 """
 
 
@@ -81,6 +79,40 @@ def parse_runtime_options(raw: Any) -> dict[str, Any]:
     return out
 
 
+def parse_alerts(raw: Any) -> dict | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("command"), list) or not raw["command"] \
+            or not all(isinstance(a, str) for a in raw["command"]):
+        raise ValueError('config "alerts" needs "command": ["program", "arg", ...]')
+    after = raw.get("after_seconds", 300)
+    if isinstance(after, bool) or not isinstance(after, (int, float)) or after < 0:
+        raise ValueError('config "alerts.after_seconds" must be a number >= 0')
+    return {"command": list(raw["command"]), "after_seconds": float(after)}
+
+
+async def send_alerts(store: Store, alerts: dict | None) -> list[str]:
+    """Tell an operator about plans stuck too long: once per plan, through their own command."""
+    if not alerts:
+        return []
+    sent = []
+    for plan in store.stuck_plans(alerts["after_seconds"]):
+        payload = json.dumps({"plan_id": plan["plan_id"], "status": plan["status"], "goal": plan["raw"].get("goal"),
+                              "stuck_since": plan["stuck_since"], "result": plan["result"]}).encode()
+        try:
+            proc = await asyncio.create_subprocess_exec(*alerts["command"], stdin=asyncio.subprocess.PIPE)
+            await proc.communicate(payload)
+        except OSError:
+            log.exception("alert command failed for %s", plan["plan_id"])
+            continue
+        if proc.returncode == 0:
+            store.mark_alerted(plan["plan_id"])
+            sent.append(plan["plan_id"])
+        else:
+            log.warning("alert command exited %s for %s; will retry", proc.returncode, plan["plan_id"])
+    return sent
+
+
 @dataclass
 class GatewayConfig:
     servers: dict[str, Any]
@@ -90,6 +122,9 @@ class GatewayConfig:
     reader: dict | None = None
     runtime: dict[str, Any] | None = None  # Runtime keyword arguments, from parse_runtime_options
     reconcile_seconds: float = 0.0
+    # {"command": [argv...], "after_seconds": 300}: run when a plan stays failed_partial or needs_attention
+    # that long. It gets the plan as JSON on stdin, once per plan.
+    alerts: dict | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> GatewayConfig:
@@ -106,6 +141,7 @@ class GatewayConfig:
             reader=data.get("reader"),
             runtime=parse_runtime_options(data.get("runtime")),
             reconcile_seconds=float((data.get("runtime") or {}).get("reconcile_seconds", 0)),
+            alerts=parse_alerts(data.get("alerts")),
         )
 
     @property
@@ -121,7 +157,7 @@ def make_reader(spec: dict | None):
     return AnthropicReader(model=spec.get("model", "claude-opus-5-5"), effort=spec.get("effort", "low"))
 
 
-def search_index(runtime: Runtime, query: str = "") -> dict:
+def search_index(runtime: Runtime, query: str = "", guide: bool = False) -> dict:
     """Compact index of allowed tools; full contracts only for tools matching `query`."""
     m = runtime.manifest
     catalog = runtime.upstreams.catalog
@@ -148,7 +184,14 @@ def search_index(runtime: Runtime, query: str = "") -> dict:
         elif query:
             continue
         tools.append(entry)
-    return {"mode": m.mode, "tools": tools, "plan_guide": PLAN_GUIDE if not query else None}
+    out: dict[str, Any] = {"mode": m.mode, "tools": tools}
+    prepared = runtime.store.list_prepared(runtime.caller)
+    if prepared:
+        out["prepared"] = prepared  # name -> params: run these with planbound_run
+    # The plan guide is in the server instructions; send it again only when asked.
+    if guide:
+        out["plan_guide"] = PLAN_GUIDE
+    return out
 
 
 class Gateway:
@@ -191,6 +234,7 @@ class Gateway:
                 for report in await runtime.recover():
                     if report["status"] != "skipped":
                         log.info("reconciled %s: %s", report["plan_id"], report["status"])
+                await send_alerts(runtime.store, self.config.alerts)
             except Exception:
                 log.exception("background reconciliation failed")
 
@@ -204,19 +248,41 @@ def build_server(gateway: Gateway) -> MCPServer:
     server = MCPServer("planbound", instructions=PLAN_GUIDE, lifespan=gateway.lifespan)
 
     @server.tool(structured_output=True)
-    async def planbound_search_tools(query: str = "") -> dict[str, Any]:
-        """List the tools you may use in a plan. Pass a query to get full schemas for matching tools."""
-        return search_index(await gateway.get_runtime(), query)
+    async def planbound_search_tools(query: str = "", guide: bool = False) -> dict[str, Any]:
+        """List the tools you may use in a plan. Pass a query for full schemas; guide=true for the plan guide."""
+        return search_index(await gateway.get_runtime(), query, guide)
 
     @server.tool(structured_output=True)
-    async def planbound_submit_plan(plan: dict, mode: str = "execute", wait_seconds: float = 20) -> dict[str, Any]:
-        """Check, preview and run a plan. mode: "compile", "preview" or "execute"."""
-        return await (await gateway.get_runtime()).submit(plan, mode=mode, wait_seconds=wait_seconds)
+    async def planbound_submit_plan(script: str = "", plan: dict | None = None, mode: str = "execute",
+                                    wait_seconds: float = 20) -> dict[str, Any]:
+        """Check, preview and run a plan: a `script` (see the guide) or a JSON `plan`.
+        mode: "compile", "preview" or "execute"."""
+        raw: Any = plan if plan is not None else script
+        return await (await gateway.get_runtime()).submit(raw, mode=mode, wait_seconds=wait_seconds)
+
+    @server.tool(structured_output=True)
+    async def planbound_prepare(name: str, script: str = "", plan: dict | None = None,
+                                example: dict | None = None) -> dict[str, Any]:
+        """Save a plan with param.x placeholders under a name; `example` gives sample params to check it."""
+        raw: Any = plan if plan is not None else script
+        return await (await gateway.get_runtime()).prepare(name, raw, example or {})
+
+    @server.tool(structured_output=True)
+    async def planbound_run(name: str, params: dict | None = None, mode: str = "execute",
+                            wait_seconds: float = 20) -> dict[str, Any]:
+        """Run a prepared plan with these params. Same checks, preview and approval as any plan."""
+        return await (await gateway.get_runtime()).run_prepared(name, params or {}, mode=mode,
+                                                                 wait_seconds=wait_seconds)
 
     @server.tool(structured_output=True)
     async def planbound_commit(plan_id: str, wait_seconds: float = 20) -> dict[str, Any]:
         """Continue a plan that was waiting for approval, or run a previewed plan."""
         return await (await gateway.get_runtime()).commit(plan_id, wait_seconds=wait_seconds)
+
+    @server.tool(structured_output=True)
+    async def planbound_cancel(plan_id: str) -> dict[str, Any]:
+        """Stop a plan before its point of no return; every step that ran is undone."""
+        return (await gateway.get_runtime()).cancel(plan_id)
 
     @server.tool(structured_output=True)
     async def planbound_inspect_handle(handle: str, path: str = "", where: dict | None = None,

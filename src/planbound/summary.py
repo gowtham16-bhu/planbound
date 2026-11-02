@@ -69,6 +69,10 @@ def _column(values: list, depth: int) -> dict:
     if all(isinstance(v, str) for v in present):
         if all(_safe(v) for v in present):
             distinct = sorted(set(present))
+            if len(distinct) == 1:
+                return {"type": "string", "value": distinct[0]}
+            if len(distinct) == len(present):  # all different (ids): the list is in the handle
+                return {"type": "string", "unique": len(distinct)}
             if len(distinct) <= MAX_HISTOGRAM:
                 return {"type": "string", "histogram": {d: present.count(d) for d in distinct}}
             return {"type": "string", "distinct": len(distinct)}

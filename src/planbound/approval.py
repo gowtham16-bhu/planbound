@@ -147,12 +147,13 @@ class PolicySigner:
             approval = self.gateway.get_approval(plan_id)
             status = plan["status"] if plan else "missing"
             if hold == "finalized":
-                if status in ("failed_compensated", "recovered_compensated"):
+                if status in ("failed_compensated", "recovered_compensated", "cancelled"):
                     self._set_hold(plan_id, "released")
                 continue
             if status in ("completed", "failed_partial", "needs_attention", "abandoned"):
                 self._set_hold(plan_id, "finalized")
-            elif status in ("failed_compensated", "recovered_compensated", "stale", "rejected", "missing") or status in ("awaiting_approval", "previewed") and approval and approval["expires_at"] < time.time():
+            elif status in ("failed_compensated", "recovered_compensated", "cancelled", "stale", "rejected",
+                            "missing") or status in ("awaiting_approval", "previewed") and approval and approval["expires_at"] < time.time():
                 self._set_hold(plan_id, "released")
 
     def _set_hold(self, plan_id: str, status: str) -> None:
