@@ -41,6 +41,12 @@ Agent ──plan──► Planbound: Check ─► Preview ─► Approve ─► 
 | `recover` racing a live gateway, or two commits of one plan | Plan leases: one driver at a time; recover only takes plans whose lease expired |
 | A stalled gateway waking up after recovery took over | Fencing tokens: the journal and fencing-aware upstreams refuse the old holder |
 | An undo service down for hours | Background reconciliation (`reconcile_seconds`) finishes the rollback when it is back |
+| A refund visible before it is rolled back | Reservations (`confirm`): held invisibly, confirmed only past the point of no return |
+| An email sent too soon | `hold_seconds`: a cancel window before irreversible steps (`planbound cancel`) |
+| An upstream that only claims to dedupe or check versions | `planbound verify` tests each claim; `require_verified` demands proof |
+| A lost answer from a server without idempotency keys | `outcome_check`: ask the server whether it happened |
+| Starting writes while the undo service is down | `undo_probe`: the plan does not start; alerts when a plan stays stuck |
+| A quarantined reader steered by injected text | Several readers must agree, and reader-driven writes always need a human |
 | Investigations that decide what to look at next | Multi-stage plans: each stage continues from earlier results with `checkpoint` |
 | Money moving without upstream guarantees | `strict_writes`: sensitive tools must declare idempotency keys and a conditional write |
 
@@ -68,7 +74,7 @@ simulated; run against a real model before quoting latency.
 
 ```bash
 uv sync --all-groups
-uv run pytest -q                     # 85 tests, incl. fault injection
+uv run pytest -q                     # 109 tests, incl. fault injection
 uv run --extra reader python -m bench.live   # real model + live reader check (needs API credentials)
 uv run python -m bench.run           # writes bench/RESULTS.md
 uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys
@@ -89,6 +95,7 @@ uv run planbound --config demo/planbound.config.json signer --keys demo/keys --b
 
 Other commands: `planbound pending`, `planbound approve <plan_id>`, `planbound deny <plan_id>`,
 `planbound recover` (reconcile every unfinished plan), `planbound resolve <plan_id> <step> --happened|--did-not-happen`, `planbound abandon <plan_id> --reason ...`,
+`planbound cancel <plan_id>`, `planbound verify <tool> --args JSON`, `planbound stuck`,
 `planbound draft` (manifest from dev-mode usage), `planbound show h://plan/node`
 (raw data for a human), `planbound keys`.
 

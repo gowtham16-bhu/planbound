@@ -164,7 +164,7 @@ def judge(run: LiveRun, world, want: list[str], spec: dict) -> None:
 async def direct(client, scenario: str, spec: dict, model: str) -> LiveRun:
     world, want = setup_world(spec)
     run = LiveRun("Direct MCP", scenario, model)
-    async with MCPUpstreams(build_servers(world)) as up:
+    async with MCPUpstreams(build_servers(world, extras=False)) as up:
         names = {api_name(n): n for n in up.catalog}
         tools = [{"name": api_name(t.name), "description": t.description or t.name,
                   "input_schema": t.input_schema or {"type": "object", "properties": {}}}
@@ -186,7 +186,7 @@ async def planbound(client, scenario: str, spec: dict, model: str) -> LiveRun:
 
     world, want = setup_world(spec)
     run = LiveRun("Planbound", scenario, model)
-    servers = build_servers(world)
+    servers = build_servers(world, extras=False)
     with tempfile.TemporaryDirectory() as tmp:
         async with MCPUpstreams(servers) as up:
             manifest = refund_manifest(up.catalog, auto_max=1e9)

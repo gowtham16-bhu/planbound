@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 
 from .approval import BudgetPolicy, PolicySigner, describe_request, generate_keys
-from .gateway import Gateway, GatewayConfig, build_server, make_reader
+from .gateway import Gateway, GatewayConfig, build_server, make_reader, send_alerts
 from .manifest import Manifest, infer_effects
 from .runtime import Runtime
 from .store import Store
@@ -36,6 +36,8 @@ def main(argv: list[str] | None = None) -> None:
         a.add_argument("--keys", default=".planbound/keys")
         a.add_argument("--yes", action="store_true")
     sub.add_parser("pending", help="list approval requests waiting for the signer or a human")
+    st = sub.add_parser("stuck", help="list plans stuck in failed_partial or needs_attention")
+    st.add_argument("--after", type=float, default=0, help="only plans stuck at least this many seconds")
     rc = sub.add_parser("recover", help="reconcile plans that did not end cleanly: retry failed undo steps, "
                                         "compensate or finish crashed plans")
     rc.add_argument("--watch", action="store_true", help="keep reconciling until stopped")
@@ -48,6 +50,12 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--did-not-happen", action="store_true", help="the write did not happen upstream")
     r.add_argument("--result", help="the tool's result as JSON, so the step can be undone")
     sub.add_parser("draft", help="draft a manifest from the tools actually used in dev mode")
+    vf = sub.add_parser("verify", help="test the guarantees a write tool claims (run against a sandbox)")
+    vf.add_argument("tool")
+    vf.add_argument("--args", required=True, help="sample arguments as JSON; probes are undone afterwards")
+    vf.add_argument("--allow-irreversible", action="store_true")
+    cn = sub.add_parser("cancel", help="stop a plan before its point of no return; what ran is undone")
+    cn.add_argument("plan_id")
     ab = sub.add_parser("abandon", help="close a plan recovery cannot finish; nothing upstream is touched")
     ab.add_argument("plan_id")
     ab.add_argument("--reason", required=True, help="why, for the record (e.g. 'refund reversed by finance')")
@@ -75,6 +83,11 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit("cancelled")
         signer = PolicySigner(store, Path(cfg.data_dir) / "signer.db", args.keys, BudgetPolicy(budget=float("inf")))
         print(json.dumps(signer.human_decide(args.plan_id, args.cmd == "approve")))
+    elif args.cmd == "stuck":
+        for plan in _stuck(cfg, args.after):
+            print(json.dumps({"plan_id": plan["plan_id"], "status": plan["status"],
+                              "stuck_seconds": round(time.time() - plan["stuck_since"]),
+                              "goal": plan["raw"].get("goal")}))
     elif args.cmd == "pending":
         store = Store(cfg.db_path)
         for req in store.approvals_with_status("pending", "escalated"):
@@ -89,6 +102,7 @@ def main(argv: list[str] | None = None) -> None:
                 for report in asyncio.run(_recover(cfg)):
                     if report["status"] != "skipped":
                         print(json.dumps(report), flush=True)
+                asyncio.run(send_alerts(Store(cfg.db_path), cfg.alerts))
                 time.sleep(args.interval)
         except KeyboardInterrupt:
             return
@@ -97,6 +111,21 @@ def main(argv: list[str] | None = None) -> None:
         rt = Runtime(store, _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},
                      **(cfg.runtime or {}))
         out = rt.resolve(args.plan_id, args.step, args.happened, json.loads(args.result) if args.result else None)
+        print(json.dumps(out, indent=2))
+        if out["status"] == "error":
+            sys.exit(1)
+    elif args.cmd == "verify":
+        out = asyncio.run(_verify(cfg, args.tool, json.loads(args.args), args.allow_irreversible))
+        print(json.dumps(out, indent=2))
+        print("Paste this into the manifest as the tool's \"verified\" entry." if out["passed"] else
+              f"Verification FAILED for: {', '.join(out['failed'])}. Do not claim these in the manifest.",
+              file=sys.stderr)
+        if not out["passed"]:
+            sys.exit(1)
+    elif args.cmd == "cancel":
+        rt = Runtime(Store(cfg.db_path), _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},
+                     **(cfg.runtime or {}))
+        out = rt.cancel(args.plan_id)
         print(json.dumps(out, indent=2))
         if out["status"] == "error":
             sys.exit(1)
@@ -131,6 +160,14 @@ def _signer(cfg: GatewayConfig, args) -> None:
         time.sleep(0.5)
 
 
+def _stuck(cfg: GatewayConfig, after: float) -> list[dict]:
+    """All stuck plans, alerted or not."""
+    store = Store(cfg.db_path)
+    ids = store.plans_with_status("failed_partial", "needs_attention")
+    plans = [store.get_plan(i) for i in ids]
+    return [p for p in plans if p["stuck_since"] and time.time() - p["stuck_since"] >= after]
+
+
 class _NoUpstreams:
     """`resolve` and `abandon` only edit the journal; they never call a tool."""
 
@@ -139,6 +176,14 @@ class _NoUpstreams:
 
     async def call(self, tool, args, meta=None):
         raise RuntimeError("resolve does not call upstream tools")
+
+
+async def _verify(cfg: GatewayConfig, tool: str, sample: dict, allow_irreversible: bool) -> dict:
+    from .verify import verify_tool
+
+    async with MCPUpstreams(cfg.servers) as up:
+        return await verify_tool(up, Manifest.load(cfg.manifest_path), tool, sample,
+                                 allow_irreversible=allow_irreversible)
 
 
 async def _recover(cfg: GatewayConfig) -> list[dict]:

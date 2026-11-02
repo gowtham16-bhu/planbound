@@ -80,6 +80,11 @@ class Refund(BaseModel):
     status: str
 
 
+class RefundList(BaseModel):
+    order_id: str
+    refunds: list[Refund]
+
+
 class EmailReceipt(BaseModel):
     message_id: str
     status: str
@@ -140,6 +145,7 @@ class World:
     calls: dict[str, int] = field(default_factory=dict)
     idem: dict[str, object] = field(default_factory=dict)
     fences: dict[str, int] = field(default_factory=dict)  # highest lease epoch seen per plan
+    ever_visible: set[str] = field(default_factory=set)  # orders anyone could ever see as refunded
     fenced_out: int = 0
     _prev_status: dict[str, str] = field(default_factory=dict)
 
@@ -193,7 +199,9 @@ def _key(ctx: Context) -> str | None:
     return _meta(ctx).get(IDEM_META)
 
 
-def build_servers(w: World) -> dict[str, MCPServer]:
+def build_servers(w: World, *, extras: bool = True) -> dict[str, MCPServer]:
+    """`extras`: also serve the reservation and lookup tools (hold/confirm/find_refunds). The benchmark
+    leaves them out, so every strategy sees the same tool catalog as before they existed."""
     crm, billing, email = MCPServer("crm"), MCPServer("billing"), MCPServer("email")
     hris, iam, payroll = MCPServer("hris"), MCPServer("iam"), MCPServer("payroll")
     ro = ToolAnnotations(readOnlyHint=True)
@@ -289,9 +297,53 @@ def build_servers(w: World) -> dict[str, MCPServer]:
             w._prev_status[order_id] = order.status
             order.status = "refunded"
             order.version += 1
+            w.ever_visible.add(order_id)
             return w.refunds[rid]
 
         return once(ctx, do)
+
+    if extras:
+        @billing.tool()
+        async def hold_refund(order_id: str, amount: float, ctx: Context) -> Refund:
+            """Reserve a refund without issuing it: nobody sees it until confirm_refund. cancel_refund drops it."""
+            await delay("billing.hold_refund")
+
+            def do() -> Refund:
+                if order_id in w.fail_refund_on:
+                    raise ToolError(f"payment processor declined refund for {order_id}")
+                order = w.orders[order_id]
+                if amount > order.amount:
+                    raise ToolError(f"refund {amount} exceeds order amount {order.amount}")
+                rid = f"RF-{len(w.refunds) + 1:05d}"
+                w.refunds[rid] = Refund(refund_id=rid, order_id=order_id, amount=amount, status="held")
+                return w.refunds[rid]
+
+            return once(ctx, do)
+
+        @billing.tool()
+        async def confirm_refund(refund_id: str, ctx: Context) -> Refund:
+            """Issue a held refund. Safe to repeat."""
+            await delay("billing.confirm_refund")
+            if w.flaky_revoke.get("confirm_refund", 0) > 0:
+                w.flaky_revoke["confirm_refund"] -= 1
+                raise ToolError("billing confirmations are temporarily unavailable")
+            fence(ctx)
+            r = w.refunds[refund_id]
+            if r.status == "held":
+                r.status = "issued"
+                order = w.orders[r.order_id]
+                w._prev_status[r.order_id] = order.status
+                order.status = "refunded"
+                order.version += 1
+                w.ever_visible.add(r.order_id)
+            return r
+
+        @billing.tool(annotations=ro)
+        async def find_refunds(order_id: str) -> RefundList:
+            """Refunds issued or held for an order (cancelled ones are left out)."""
+            await delay("billing.find_refunds")
+            return RefundList(order_id=order_id, refunds=[r for r in w.refunds.values()
+                                                          if r.order_id == order_id and r.status != "cancelled"])
 
     @billing.tool()
     async def cancel_refund(refund_id: str, ctx: Context) -> Refund:
@@ -300,7 +352,9 @@ def build_servers(w: World) -> dict[str, MCPServer]:
 
         def do() -> Refund:
             r = w.refunds[refund_id]
-            if r.status != "cancelled":
+            if r.status == "held":
+                r.status = "cancelled"  # never issued: nothing to restore
+            elif r.status != "cancelled":
                 r.status = "cancelled"
                 w.orders[r.order_id].status = w._prev_status.pop(r.order_id, "overdue")
                 w.orders[r.order_id].version += 1

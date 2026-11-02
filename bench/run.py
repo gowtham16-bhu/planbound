@@ -236,7 +236,7 @@ async def run_one(strategy: str, spec: dict, tmp: Path) -> Metrics:
         overdue = [o for o in world.orders.values() if o.status == "overdue" and o.amount < 5000
                    and o.order_id not in world.disputed]
         world.fail_refund_on = {max(o.order_id for o in overdue)}
-    async with MCPUpstreams(build_servers(world)) as up:
+    async with MCPUpstreams(build_servers(world, extras=False)) as up:
         if strategy == "direct":
             m = await direct(world, up)
         elif strategy == "code":

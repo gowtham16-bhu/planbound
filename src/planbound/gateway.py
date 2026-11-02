@@ -81,6 +81,40 @@ def parse_runtime_options(raw: Any) -> dict[str, Any]:
     return out
 
 
+def parse_alerts(raw: Any) -> dict | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get("command"), list) or not raw["command"] \
+            or not all(isinstance(a, str) for a in raw["command"]):
+        raise ValueError('config "alerts" needs "command": ["program", "arg", ...]')
+    after = raw.get("after_seconds", 300)
+    if isinstance(after, bool) or not isinstance(after, (int, float)) or after < 0:
+        raise ValueError('config "alerts.after_seconds" must be a number >= 0')
+    return {"command": list(raw["command"]), "after_seconds": float(after)}
+
+
+async def send_alerts(store: Store, alerts: dict | None) -> list[str]:
+    """Tell an operator about plans stuck too long: once per plan, through their own command."""
+    if not alerts:
+        return []
+    sent = []
+    for plan in store.stuck_plans(alerts["after_seconds"]):
+        payload = json.dumps({"plan_id": plan["plan_id"], "status": plan["status"], "goal": plan["raw"].get("goal"),
+                              "stuck_since": plan["stuck_since"], "result": plan["result"]}).encode()
+        try:
+            proc = await asyncio.create_subprocess_exec(*alerts["command"], stdin=asyncio.subprocess.PIPE)
+            await proc.communicate(payload)
+        except OSError:
+            log.exception("alert command failed for %s", plan["plan_id"])
+            continue
+        if proc.returncode == 0:
+            store.mark_alerted(plan["plan_id"])
+            sent.append(plan["plan_id"])
+        else:
+            log.warning("alert command exited %s for %s; will retry", proc.returncode, plan["plan_id"])
+    return sent
+
+
 @dataclass
 class GatewayConfig:
     servers: dict[str, Any]
@@ -90,6 +124,9 @@ class GatewayConfig:
     reader: dict | None = None
     runtime: dict[str, Any] | None = None  # Runtime keyword arguments, from parse_runtime_options
     reconcile_seconds: float = 0.0
+    # {"command": [argv...], "after_seconds": 300}: run when a plan stays failed_partial or needs_attention
+    # that long. It gets the plan as JSON on stdin, once per plan.
+    alerts: dict | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> GatewayConfig:
@@ -106,6 +143,7 @@ class GatewayConfig:
             reader=data.get("reader"),
             runtime=parse_runtime_options(data.get("runtime")),
             reconcile_seconds=float((data.get("runtime") or {}).get("reconcile_seconds", 0)),
+            alerts=parse_alerts(data.get("alerts")),
         )
 
     @property
@@ -191,6 +229,7 @@ class Gateway:
                 for report in await runtime.recover():
                     if report["status"] != "skipped":
                         log.info("reconciled %s: %s", report["plan_id"], report["status"])
+                await send_alerts(runtime.store, self.config.alerts)
             except Exception:
                 log.exception("background reconciliation failed")
 
@@ -217,6 +256,11 @@ def build_server(gateway: Gateway) -> MCPServer:
     async def planbound_commit(plan_id: str, wait_seconds: float = 20) -> dict[str, Any]:
         """Continue a plan that was waiting for approval, or run a previewed plan."""
         return await (await gateway.get_runtime()).commit(plan_id, wait_seconds=wait_seconds)
+
+    @server.tool(structured_output=True)
+    async def planbound_cancel(plan_id: str) -> dict[str, Any]:
+        """Stop a plan before its point of no return; every step that ran is undone."""
+        return (await gateway.get_runtime()).cancel(plan_id)
 
     @server.tool(structured_output=True)
     async def planbound_inspect_handle(handle: str, path: str = "", where: dict | None = None,
