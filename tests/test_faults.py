@@ -4,8 +4,10 @@
 same MCP path as production.
 """
 
+import asyncio
 import copy
 import dataclasses
+import time
 
 import pytest
 
@@ -276,10 +278,97 @@ def test_enforce_mode_inference_does_not_trust_names_alone():
 
 
 def test_idempotency_keys_are_off_unless_declared():
-    m = Manifest.from_json({"tools": {"billing.refund_order": {
-        "state": "compensatable", "compensator": {"tool": "billing.cancel_refund", "args": {}}}}})
+    m = Manifest.from_json({"tools": {
+        "billing.refund_order": {"state": "compensatable",
+                                 "compensator": {"tool": "billing.cancel_refund", "args": {}}},
+        "billing.cancel_refund": {"state": "idempotent_write"}}})
     assert m.tools["billing.refund_order"].idempotency_keys is False
     round_trip = Manifest.from_json(copy.deepcopy(manifest_json := {"tools": {"x.send_note": {
         "state": "irreversible", "idempotency_keys": True}}}))
     assert round_trip.to_json()["tools"]["x.send_note"]["idempotency_keys"] is True
     assert manifest_json  # unchanged input
+
+
+def test_compensators_must_be_safe_to_retry():
+    tools = {"billing.refund_order": {"state": "compensatable",
+                                      "compensator": {"tool": "billing.cancel_refund", "args": {}}}}
+    with pytest.raises(ValueError, match="must be listed"):
+        Manifest.from_json({"tools": tools})
+    tools["billing.cancel_refund"] = {"state": "irreversible"}
+    with pytest.raises(ValueError, match="retried during rollback"):
+        Manifest.from_json({"tools": tools})
+    tools["billing.cancel_refund"]["idempotency_keys"] = True
+    Manifest.from_json({"tools": tools})
+
+
+# ---------------------------------------------------------------- leases: one driver per plan
+
+
+async def test_recover_does_not_touch_a_plan_a_live_gateway_is_running(env):
+    live = env.runtime(manifest(env), lease_ttl_s=60)
+    live.crash_after_writes = 1  # stands in for a gateway that is merely slow, still holding its lease
+    with pytest.raises(SimulatedCrash):
+        await live.submit(refund_plan())
+    done = env.world.refunded()
+    reports = await env.runtime(manifest(env)).recover()
+    assert [r["status"] for r in reports] == ["skipped"], reports
+    assert env.world.refunded() == done  # nothing compensated under the live gateway's feet
+
+    env.store.db.execute("UPDATE plans SET lease_until = ?", (time.time() - 1,))  # the lease runs out
+    reports = await env.runtime(manifest(env)).recover()
+    assert reports[0]["status"] == "recovered_compensated", reports
+    assert env.world.refunded() == []
+
+
+async def test_a_gateway_that_lost_its_lease_stops_writing(env):
+    up = Faulty(env.up)
+    plan = refund_plan()
+    plan["nodes"][4]["concurrency"] = 1
+    stalled = env.runtime(manifest(env), upstreams=up, lease_ttl_s=60)
+    rescuer = env.runtime(manifest(env))
+
+    def takeover(args):  # the gateway stalls past its lease and recovery claims the plan
+        [plan_id] = env.store.plans_with_status("running")
+        env.store.db.execute("UPDATE plans SET lease_until = ?", (time.time() - 1,))
+        assert env.store.claim(plan_id, rescuer.instance_id, 60, ("running",))
+
+    up.before("billing.refund_order", takeover)
+    res = await stalled.submit(plan)
+    assert res["status"] == "running" and "took the plan over" in res["message"], res
+    assert len(env.world.refunds) == 1  # it stopped after the write in progress
+    reports = await rescuer.recover()
+    assert reports[0]["status"] == "recovered_compensated", reports
+    assert env.world.refunded() == []
+
+
+async def test_two_commits_of_one_plan_run_it_once(env):
+    a, b = env.runtime(manifest(env)), env.runtime(manifest(env))
+    want = eligible_ids(env.world)
+    pv = await a.submit(refund_plan(), mode="preview")
+    results = await asyncio.gather(a.commit(pv["plan_id"]), b.commit(pv["plan_id"]))
+    winners = [r for r in results if "got there first" not in r.get("message", "")]
+    assert len(winners) == 1 and winners[0]["status"] == "completed", results
+    assert len(env.world.refunds) == len(want)  # every order refunded exactly once
+    assert len(env.world.emails) == 1
+
+
+# ---------------------------------------------------------------- abandoning what recovery cannot finish
+
+
+async def test_abandon_closes_a_plan_recovery_cannot_finish(env):
+    up = Faulty(env.up)
+    up.lose_answer("billing.refund_order")
+    m = manifest(env, idempotency_keys=False)
+    res = await env.runtime(m, upstreams=up).submit(refund_plan())
+    assert res["status"] == "needs_attention"
+    rt = env.runtime(m)
+    out = rt.abandon(res["plan_id"], "finance reversed the refund by hand")
+    assert out["status"] == "abandoned" and out["left_as_is"]["unknown"] == res["unknown"]
+    assert env.store.get_plan(res["plan_id"])["status"] == "abandoned"
+    assert await rt.recover() == []  # no longer reconciled
+    assert rt.abandon(res["plan_id"], "again")["status"] == "error"
+
+
+async def test_only_unfinished_plans_can_be_abandoned(env):
+    res = await env.runtime(manifest(env)).submit(refund_plan())
+    assert env.runtime(manifest(env)).abandon(res["plan_id"], "oops")["status"] == "error"

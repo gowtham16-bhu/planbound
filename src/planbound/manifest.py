@@ -162,6 +162,17 @@ class Manifest:
                 conditional=conditional,
                 confirm_read_only=bool(raw.get("confirm_read_only", False)),
             )
+        for name, eff in tools.items():
+            # Undo steps are retried (and re-sent by recovery), so repeating one must be harmless.
+            if eff.compensator is None:
+                continue
+            comp_name = eff.compensator.get("tool")
+            comp = tools.get(comp_name)
+            if comp is None:
+                raise ValueError(f"tool {name}: its compensator {comp_name!r} must be listed in the manifest")
+            if comp.state != "idempotent_write" and not comp.idempotency_keys:
+                raise ValueError(f"tool {name}: compensator {comp_name!r} is retried during rollback, so it must "
+                                 "be idempotent_write or declare \"idempotency_keys\": true")
         return cls(
             mode=data.get("mode", "enforce"),
             unlisted_tool_policy=defaults.get("unlisted_tool_policy", "reject"),

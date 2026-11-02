@@ -46,6 +46,9 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--did-not-happen", action="store_true", help="the write did not happen upstream")
     r.add_argument("--result", help="the tool's result as JSON, so the step can be undone")
     sub.add_parser("draft", help="draft a manifest from the tools actually used in dev mode")
+    ab = sub.add_parser("abandon", help="close a plan recovery cannot finish; nothing upstream is touched")
+    ab.add_argument("plan_id")
+    ab.add_argument("--reason", required=True, help="why, for the record (e.g. 'refund reversed by finance')")
     sh = sub.add_parser("show", help="print a handle's raw data for a human (never sent to the model)")
     sh.add_argument("handle")
     args = p.parse_args(argv)
@@ -83,6 +86,12 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(out, indent=2))
         if out["status"] == "error":
             sys.exit(1)
+    elif args.cmd == "abandon":
+        rt = Runtime(Store(cfg.db_path), _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {})
+        out = rt.abandon(args.plan_id, args.reason)
+        print(json.dumps(out, indent=2))
+        if out["status"] == "error":
+            sys.exit(1)
     elif args.cmd == "draft":
         out = asyncio.run(_draft(cfg))
         print(f"Draft written to {out}. Review every entry before using it in enforce mode.")
@@ -108,7 +117,7 @@ def _signer(cfg: GatewayConfig, args) -> None:
 
 
 class _NoUpstreams:
-    """`resolve` only edits the journal; it never calls a tool."""
+    """`resolve` and `abandon` only edit the journal; they never call a tool."""
 
     def __init__(self) -> None:
         self.catalog: dict = {}

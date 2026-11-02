@@ -68,6 +68,10 @@ class SimulatedCrash(Exception):
     """Test hook: stands in for the gateway process dying mid-plan."""
 
 
+class LeaseLost(Exception):
+    """Another gateway or `planbound recover` took this plan over: stop at once, touch nothing more."""
+
+
 @dataclass
 class Run:
     plan_id: str
@@ -94,6 +98,7 @@ class Runtime:
         retry_attempts: int = 3,
         retry_delay_s: float = 0.2,
         compensation_attempts: int = 5,
+        lease_ttl_s: float = 60.0,
     ):
         self.store = store
         self.upstreams = upstreams
@@ -104,6 +109,8 @@ class Runtime:
         self.retry_attempts = retry_attempts
         self.retry_delay_s = retry_delay_s
         self.compensation_attempts = compensation_attempts
+        self.lease_ttl_s = lease_ttl_s
+        self.instance_id = "rt_" + secrets.token_hex(6)
         self.crash_after_writes: int | None = None
         self._crashed = False
         self._writes_done = 0
@@ -188,9 +195,38 @@ class Runtime:
         Safe to run again and again; finished steps are never repeated.
         """
         reports = []
-        for plan_id in self.store.plans_with_status("running", "failed_partial", "needs_attention"):
-            reports.append(await self._recover_one(plan_id))
+        statuses = ("running", "failed_partial", "needs_attention")
+        for plan_id in self.store.plans_with_status(*statuses):
+            if not self.store.claim(plan_id, self.instance_id, self.lease_ttl_s, statuses):
+                # A live gateway is still driving it (its lease is fresh). Never recover a running plan.
+                reports.append({"status": "skipped", "plan_id": plan_id,
+                                "message": "Another gateway holds this plan's lease; it is still running. "
+                                           "Try again once the lease expires."})
+                continue
+            try:
+                reports.append(await self._recover_one(plan_id))
+            except LeaseLost:
+                reports.append({"status": "skipped", "plan_id": plan_id,
+                                "message": "Another process took this plan over during recovery."})
         return reports
+
+    def abandon(self, plan_id: str, reason: str) -> dict:
+        """A human closes a plan that recovery cannot finish. Nothing upstream is touched; the journal stays
+        as the record of what happened, and `recover` no longer picks the plan up."""
+        rec = self.store.get_plan(plan_id)
+        if rec is None:
+            return {"status": "error", "message": f"unknown plan {plan_id}"}
+        if not self.store.claim(plan_id, self.instance_id, self.lease_ttl_s, ("failed_partial", "needs_attention")):
+            return {"status": "error",
+                    "message": f"only a failed_partial or needs_attention plan that no gateway is running can be "
+                               f"abandoned (this one is {rec['status']})"}
+        journal = self.store.journal(plan_id)
+        left = {s: [_step(e) for e in journal if e["status"] == s]
+                for s in ("COMPLETED", "UNKNOWN", "COMPENSATION_FAILED")}
+        result = {"status": "abandoned", "plan_id": plan_id, "reason": reason, "previous": rec["result"],
+                  "left_as_is": {k.lower(): v for k, v in left.items() if v}}
+        self.store.update_plan(plan_id, status="abandoned", result=result)
+        return result
 
     def resolve(self, plan_id: str, step: str, happened: bool, result: Any = None) -> dict:
         """A human settles a write whose outcome was unknown: `step` is `node[index]`, as reported."""
@@ -407,11 +443,20 @@ class Runtime:
             return {"status": "stale", "plan_id": plan_id, "code": "E_PREVIEW_STALE",
                     "message": "The data changed since the preview, so the approved writes no longer match. "
                                "Nothing was written. Submit the plan again for a fresh preview."}
-        self.store.update_plan(plan_id, status="running")
+        if not self.store.claim(plan_id, self.instance_id, self.lease_ttl_s, ("awaiting_approval", "previewed"),
+                                new_status="running"):
+            rec = self.store.get_plan(plan_id)
+            return {"status": rec["status"], "plan_id": plan_id,
+                    "message": "Another commit of this plan got there first; it was not run twice."}
         remaining = [n for n in compiled.order if n not in compiled.read_frontier]
         for nid in remaining:
             run.outputs.pop(nid, None)
-        return await self._execute(run, remaining)
+        try:
+            return await self._execute(run, remaining)
+        except LeaseLost:
+            return {"status": "running", "plan_id": plan_id,
+                    "message": "This gateway stalled long enough for its lease to expire, and recovery took "
+                               "the plan over. It stopped without touching anything more."}
 
     async def _execute(self, run: Run, nodes: list[str]) -> dict:
         c = run.compiled
@@ -420,7 +465,7 @@ class Runtime:
         for wave in _waves_of(nodes, c.sched_deps, done):
             results = await asyncio.gather(*(self._run_node(run, nid, real=True) for nid in wave),
                                            return_exceptions=True)
-            crash = next((r for r in results if isinstance(r, SimulatedCrash)), None)
+            crash = next((r for r in results if isinstance(r, (SimulatedCrash, LeaseLost))), None)
             if crash:
                 raise crash
             errors = [r for r in results if isinstance(r, BaseException)]
@@ -496,7 +541,7 @@ class Runtime:
                 results = await asyncio.gather(*(one(i, a) for i, a in calls), return_exceptions=True)
                 bad = [r for r in results if isinstance(r, BaseException)]
                 if bad:
-                    raise bad[0]
+                    raise next((r for r in bad if isinstance(r, (SimulatedCrash, LeaseLost))), bad[0])
                 value = results
             elif node.op in ("filter", "partition"):
                 items = resolve(node.raw["input"], ctx)
@@ -539,6 +584,8 @@ class Runtime:
             raise SimulatedCrash("gateway already crashed")
         if ni.kind != "write":
             return await self.upstreams.call(ni.tool, args)
+        if not self.store.renew(run.plan_id, self.instance_id, self.lease_ttl_s):
+            raise LeaseLost(f"{run.plan_id} was taken over by another process")
         key = f"{run.plan_id}:{ni.node.id}:{idx}"
         prior = self.store.journal_find(key)
         if prior is not None:
@@ -597,6 +644,8 @@ class Runtime:
         entries = [e for e in self.store.journal(plan_id)
                    if e["state"] == "compensatable" and e["status"] in ("COMPLETED", "COMPENSATION_FAILED")]
         for e in reversed(entries):
+            if not self.store.renew(plan_id, self.instance_id, self.lease_ttl_s):
+                raise LeaseLost(f"{plan_id} was taken over by another process")
             error: str | None = None
             for attempt in range(self.compensation_attempts):
                 try:
@@ -608,7 +657,7 @@ class Runtime:
                     await self.upstreams.call(tool, args, {IDEM_META: e["idem_key"] + ":compensate"})
                     error = None
                     break
-                except SimulatedCrash:
+                except (SimulatedCrash, LeaseLost):
                     raise
                 except Exception as ex:  # noqa: BLE001 - every failure must be recorded, never raised mid-rollback
                     error = str(ex)
@@ -653,7 +702,8 @@ class Runtime:
             if blocked:
                 result = {"status": "needs_attention", "plan_id": plan_id,
                           "note": f"Rolling forward would run irreversible step(s) {', '.join(blocked)} long after "
-                                  "approval. Submit them as a new plan instead."}
+                                  "approval, so recover will not. Submit them as a new plan if still wanted, then "
+                                  "close this one with `planbound abandon`."}
             else:
                 result = await self._execute(run, remaining)
         result["recovered"] = True

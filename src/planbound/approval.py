@@ -147,7 +147,7 @@ class PolicySigner:
                 if status in ("failed_compensated", "recovered_compensated"):
                     self._set_hold(plan_id, "released")
                 continue
-            if status in ("completed", "failed_partial", "needs_attention"):
+            if status in ("completed", "failed_partial", "needs_attention", "abandoned"):
                 self._set_hold(plan_id, "finalized")
             elif status in ("failed_compensated", "recovered_compensated", "stale", "rejected", "missing"):
                 self._set_hold(plan_id, "released")

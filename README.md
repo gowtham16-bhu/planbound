@@ -38,6 +38,7 @@ Agent ──plan──► Planbound: Check ─► Preview ─► Approve ─► 
 | An undo step fails during rollback | Retried with backoff; still failing → `failed_partial`, and `planbound recover` retries it later |
 | A write gets no answer | Re-sent with the same key only if that can't repeat it; otherwise `needs_attention` and `planbound resolve`, never a guess |
 | Data changes between the re-read and the write | `conditional` writes pass the version read earlier; the server refuses → `E_WRITE_CONFLICT`, rolled back |
+| `recover` racing a live gateway, or two commits of one plan | Plan leases: one driver at a time; recover only takes plans whose lease expired |
 | Money moving without upstream guarantees | `strict_writes`: sensitive tools must declare idempotency keys and a conditional write |
 
 ## Benchmark (real MCP calls, simulated model)
@@ -64,7 +65,7 @@ simulated; run against a real model before quoting latency.
 
 ```bash
 uv sync --all-groups
-uv run pytest -q                     # 57 tests, incl. fault injection
+uv run pytest -q                     # 63 tests, incl. fault injection
 uv run python -m bench.run           # writes bench/RESULTS.md
 uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys
 ```
@@ -80,7 +81,7 @@ uv run planbound --config demo/planbound.config.json signer --keys demo/keys --b
 ```
 
 Other commands: `planbound pending`, `planbound approve <plan_id>`, `planbound deny <plan_id>`,
-`planbound recover` (reconcile every unfinished plan), `planbound resolve <plan_id> <step> --happened|--did-not-happen`,
+`planbound recover` (reconcile every unfinished plan), `planbound resolve <plan_id> <step> --happened|--did-not-happen`, `planbound abandon <plan_id> --reason ...`,
 `planbound draft` (manifest from dev-mode usage), `planbound show h://plan/node`
 (raw data for a human), `planbound keys`.
 

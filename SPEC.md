@@ -67,6 +67,7 @@ Owned by the operator. Server annotations are hints; only this file is trusted (
 | `requires_approval` | Always send plans using this tool to the policy signer |
 | `idempotency_keys` | The operator confirms the upstream honours `io.planbound/idempotency-key` (default **false**). Without it a write that gets no answer is never re-sent; it becomes `UNKNOWN` |
 | `conditional` | `{"arg": "expected_version", "conflict_pattern"?: "<regex>"}`: the upstream refuses the write if `arg` no longer matches. The plan must fill `arg` from a read (`$ref`/`$item`), else `E_CONDITIONAL_REQUIRED`; a refusal matching the pattern fails the step with `E_WRITE_CONFLICT` and the plan rolls back |
+| `compensator` | The undo call. Its tool must be listed and be `idempotent_write` or declare `idempotency_keys: true`, because rollback retries it; otherwise the manifest does not load |
 | `confirm_read_only` | Needed to mark a tool `read_only` when its name says it writes (`refund_`, `send_`, `delete_`, …); otherwise the manifest does not load |
 
 **`defaults.strict_writes`.** When true, every *sensitive* write (one with a `cost` or
@@ -168,6 +169,15 @@ is rejected; a second irreversible step needs `allow_partial_irreversible`.
    had not run. `planbound resolve <plan> <node[i]> --happened|--did-not-happen [--result JSON]`
    records what a human found upstream for an `UNKNOWN` step; the next `recover` continues from it.
    The policy signer releases a finalized budget hold once a plan is fully compensated.
+   `planbound abandon <plan> --reason "..."` closes a `failed_partial` or `needs_attention` plan that
+   recovery cannot finish (for example a second irreversible step it will not start long after
+   approval). Nothing upstream is touched; the result lists what was left as is, and `recover` no
+   longer picks it up.
+8. **Leases.** One process drives a plan at a time. Commit claims the plan atomically
+   (`previewed`/`awaiting_approval` → `running`), so two commits of one plan run it once. The holder
+   renews a lease (`lease_ttl_s`, default 60s) before every write and every undo step. `recover`
+   only takes plans whose lease has expired, so it never compensates a plan a live gateway is still
+   running; a gateway that finds its lease taken stops at once (`LeaseLost`).
 
 ---
 
@@ -191,6 +201,9 @@ views under the same rules. Trusted sources and `display` receipts are the only 
   require them (`strict_writes`) but cannot make a server honour what it claims to.
 - **Rollback can still be stuck.** Undo steps are retried and reconciled, but if a compensator keeps
   failing the plan stays `failed_partial` until the upstream recovers or a human steps in.
+- **Leases are not fencing.** A gateway that stalls longer than `lease_ttl_s` *between* renewing and
+  sending a write can still send it after recovery took over. Recovery then sees the write as in
+  flight and handles it like a crash. Closing that gap needs upstreams that check a fencing token.
 - **The manifest is trusted.** The load-time and hint checks catch obvious mislabels, not a
   write tool with a read-like name and no annotations.
 - **Approval channel.** The gateway only holds public keys, but the policy signer and the human
