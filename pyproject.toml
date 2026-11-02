@@ -15,7 +15,11 @@ reader = ["anthropic>=0.40"]
 planbound = "planbound.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = [
+    "pillow>=13.0.0",
+    "pytest>=8",
+    "ruff==0.16.9",
+]
 
 [tool.pytest.ini_options]
 addopts = "-p no:asyncio"

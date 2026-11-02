@@ -1,114 +1,87 @@
+<div align="center">
+
 # Planbound
 
-**Prepared statements and sagas for MCP agent actions.**
+**Prepared statements and sagas for MCP agent actions.**<br>
+*AI agents don't need a babysitter. They need a budget.*
 
-AI agents don't need a babysitter. They need a budget.
+[![CI](https://github.com/gowtham16-bhu/planbound/actions/workflows/ci.yml/badge.svg)](https://github.com/gowtham16-bhu/planbound/actions/workflows/ci.yml)
+![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-3776AB?logo=python&logoColor=white)
+![MCP gateway](https://img.shields.io/badge/MCP-drop--in%20gateway-6E56CF)
+![Status v0.1](https://img.shields.io/badge/status-v0.1-orange)
 
-Planbound sits between your agent and your existing MCP servers. Instead of calling tools one
-by one (or running a generated script), the agent sends **one bounded plan**, written as a short
-script that Planbound parses (never runs), or runs a plan it prepared earlier by name. Planbound:
+<img src="docs/demo/planbound.gif" alt="Planbound demo: an agent sends one plan, sees an exact preview, commits it, a failing refund is rolled back, and an injected note never reaches the model" width="860">
 
-1. **checks it** before anything runs: bounds, data flow, who it may act on, a safe order;
-2. **runs only the reads** and shows the exact impact: *"2 refunds, ₹4,500, 1 email"*;
-3. **gets it approved by a budget policy**, and pages a human only when a plan is over the limit;
-4. **runs undoable steps first**, the point of no return last, and **rolls back** if anything fails.
+<sub>A real run against the mock MCP servers: every number on screen comes from it (<a href="docs/demo/make_demo.py">docs/demo/make_demo.py</a>).</sub>
 
-The model only sees summaries computed by code, never raw text from your tools, so a
-"ignore your instructions" note hidden in a support ticket has no way in. Your MCP servers
-don't change.
+</div>
 
-```
-Agent ──plan──► Planbound: Check ─► Preview ─► Approve ─► Commit ──► CRM · Billing · Email (unchanged)
-      ◄─summaries only─┘
-```
+---
 
-## What it guarantees
+Your agent is about to refund 40 orders and email a customer. **What will it touch? What if
+refund #17 fails? What if a support note says "ignore your instructions"?**
 
-| Problem | What Planbound does |
+Planbound sits between the agent and your existing MCP servers. Instead of twenty tool calls, the
+agent sends **one bounded plan**, and Planbound:
+
+| | |
 |---|---|
-| Prompt injection through tool output | Untrusted text never reaches the model; it gets counts, sums, ids |
-| Poisoned or changed tool descriptions | Tool contracts are hash-pinned; the model sees operator-reviewed descriptions |
-| "How much will this touch?" | Every `map` declares `max_items`; per-call and per-plan cost limits, checked statically and on real data |
-| Refund #17 fails after #1–16 ran | Automatic compensation in reverse order |
-| Two irreversible actions half-done | Compile error: at most one point of no return, after every undoable step |
-| Data changed while waiting for approval | The commit re-reads; a mismatch stops with `E_PREVIEW_STALE`, nothing written |
-| Approval fatigue / the agent approving itself | Budget policy signs (Ed25519, separate process); humans only at the edge |
-| Many small plans to dodge a limit | The signer keeps a rolling budget with authorization holds |
-| Acting on the wrong employee | Identity binding: `employee_id` must be `{"$caller": "employee_id"}` |
-| Gateway crash mid-plan | SQLite journal + idempotency keys; `planbound recover` compensates or rolls forward |
-| An undo step fails during rollback | Retried with backoff; still failing → `failed_partial`, and `planbound recover` retries it later |
-| A write gets no answer | Re-sent with the same key only if that can't repeat it; otherwise `needs_attention` and `planbound resolve`, never a guess |
-| Data changes between the re-read and the write | `conditional` writes pass the version read earlier; the server refuses → `E_WRITE_CONFLICT`, rolled back |
-| `recover` racing a live gateway, or two commits of one plan | Plan leases: one driver at a time; recover only takes plans whose lease expired |
-| A stalled gateway waking up after recovery took over | Fencing tokens: the journal and fencing-aware upstreams refuse the old holder |
-| An undo service down for hours | Background reconciliation (`reconcile_seconds`) finishes the rollback when it is back |
-| A refund visible before it is rolled back | Reservations (`confirm`): held invisibly, confirmed only past the point of no return |
-| An email sent too soon | `hold_seconds`: a cancel window before irreversible steps (`planbound cancel`) |
-| An upstream that only claims to dedupe or check versions | `planbound verify` tests each claim; `require_verified` demands proof |
-| A lost answer from a server without idempotency keys | `outcome_check`: ask the server whether it happened |
-| Starting writes while the undo service is down | `undo_probe`: the plan does not start; alerts when a plan stays stuck |
-| A quarantined reader steered by injected text | Several readers must agree, and reader-driven writes always need a human |
-| Investigations that decide what to look at next | Multi-stage plans: each stage continues from earlier results with `checkpoint` |
-| Money moving without upstream guarantees | `strict_writes`: sensitive tools must declare idempotency keys and a conditional write |
+| 🧱 **Checks it** | before anything runs: bounds, data flow, who it may act on, a safe order |
+| 🔍 **Previews it** | runs only the reads and shows the exact impact: *"9 refunds · ₹20,750 · 1 email"* |
+| ✍️ **Gets it approved** | by a budget policy that signs; a human only when a plan is over the limit |
+| ↺ **Commits it as a saga** | undoable steps first, the point of no return last, rolled back if anything fails |
+| 🛡️ **Answers in numbers** | the model sees counts, sums and ids computed by code, never raw text from your tools |
 
-## Benchmark (real MCP calls, simulated model)
+Your MCP servers don't change.
 
-Same task every way: *refund C-42's overdue orders under ₹5,000 with no open dispute, email one receipt*.
-Direct calling gets every advantage (parallel tool calls, server-side status filter). Full table: [bench/RESULTS.md](bench/RESULTS.md).
+## How it works
 
-| | Direct MCP | Code mode | Planbound, JSON plan | Planbound, script | Planbound, prepared (repeat run) |
-|---|---|---|---|---|---|
-| LLM turns | 4 | 2 | 2 | 2 | **2** |
-| Tokens the model reads | 8,213 | **1,497** | 2,127 | 1,873 | 1,766 |
-| Tokens the model writes | 136 | 179 | 348 | 187 | **43** |
-| Untrusted text in context (injected note) | 227 tok, **incl. injection** | 0 (this script didn't print it) | **0 (by construction)** | **0** | **0** |
-| One refund fails mid-batch | **1 refund left done** | **1 refund left done** | **nothing changed** | **nothing changed** | **nothing changed** |
-| Modeled latency | 5.4s | 4.6s | 7.4s | 4.6s | **2.2s** |
-
-Where the cost went, and what removed it:
-- **Output tokens drive latency** (60 tok/s in this model). A JSON plan is verbose, so plans can be
-  written as a **script**: a small subset of Python syntax that is only parsed, never run, and
-  translates one-to-one into the same JSON plan (`tests/test_script.py` checks they are identical).
-  Same checks, about half the output; script plans now match code mode.
-- **Repeated tasks** don't need a plan at all: `planbound_prepare` stores a plan with `param.*`
-  placeholders once, then `planbound_run(name, params)` costs ~40 output tokens. Every run is still
-  compiled, previewed, approved and journaled. (The first run costs what the script row costs.)
-- **Input tokens**: the plan guide was sent twice (server instructions *and* the tool index) and is
-  now sent once, in a shorter, script-first form; summaries no longer list every unique id (they
-  stay one `planbound_inspect_handle` call away).
-
-The model is simulated; `bench/live.py` measures the same with a real model.
-
-## Quick start
-
-```bash
-uv sync --all-groups
-uv run pytest -q                     # 127 tests, incl. fault injection
-uv run --extra reader python -m bench.live   # real model + live reader check (needs API credentials)
-uv run python -m bench.run           # writes bench/RESULTS.md
-uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys
+```mermaid
+flowchart LR
+    A(["🤖 Agent"]) -- "one plan" --> C
+    subgraph PB ["Planbound gateway"]
+        C["① Check<br/>bounds · data flow · identity · order"] --> P["② Preview<br/>reads run, writes counted"]
+        P --> AP{"③ Approve<br/>budget policy"}
+        AP -- "within budget" --> X["④ Commit<br/>undoable first, irreversible last"]
+        AP -- "over the limit" --> H(["👤 Human signs"]) --> X
+        X -. "a step fails" .-> R["↺ Roll back<br/>newest first, retried"]
+    end
+    subgraph UP ["Your MCP servers"]
+        S1[("CRM")]
+        S2[("Billing")]
+        S3[("Email")]
+    end
+    X --> UP
+    PB -- "summaries only" --> A
 ```
 
-The demo config includes the optional `runtime` section (`lease_seconds`, `retry_attempts`,
-`compensation_attempts`); see [SPEC.md](SPEC.md) §4.
+## A plan, in ten lines
 
-Run the gateway (point any MCP client at it) and the policy signer in another terminal:
+Plans are written as a small subset of Python syntax. Planbound **parses it, never runs it**, and
+turns it into a checked plan:
 
-```bash
-uv run planbound --config demo/planbound.config.json serve
+```python
+# goal: refund C-42's overdue orders under 5000 without disputes, email one receipt
+cust     = crm.get_customer(customer_id="C-42")
+orders   = billing.list_orders(customer_id="C-42", status="overdue")
+disputes = billing.list_disputes(customer_id="C-42")
+eligible = filter(orders.orders, item.amount < 5000 and item.order_id not in disputes.order_ids)
+refunds  = map(eligible, billing.refund_order(order_id=item.order_id, amount=item.amount), max_items=20)
+notify   = email.send_email(to=cust.email, template="refund_processed",
+                            vars={"count": count(eligible), "total": sum(eligible, "amount")},
+                            after=[refunds])
+return eligible, refunds, notify
 ```
 
-```bash
-uv run planbound --config demo/planbound.config.json signer --keys demo/keys --budget 50000
-```
+What comes back is numbers, not text. With `max_items=50` the compiler refuses instead:
+*worst case 500,000 is above the per-plan limit 200,000; lower max_items to at most 20.*
 
-Other commands: `planbound pending`, `planbound approve <plan_id>`, `planbound deny <plan_id>`,
-`planbound recover` (reconcile every unfinished plan), `planbound resolve <plan_id> <step> --happened|--did-not-happen`, `planbound abandon <plan_id> --reason ...`,
-`planbound cancel <plan_id>`, `planbound verify <tool> --args JSON`, `planbound stuck`,
-`planbound draft` (manifest from dev-mode usage), `planbound show h://plan/node`
-(raw data for a human), `planbound keys`.
+Doing the same task every day? Prepare it once with `param.*` placeholders, then
+`planbound_run("refund_overdue", {"customer": "C-42", "max_amount": 5000})` costs about 40 output
+tokens, with every check, preview and approval still applied.
 
-## A plan
+<details>
+<summary>The same plan as JSON (also accepted)</summary>
 
 ```json
 {"planbound": "0.1", "goal": "Refund eligible overdue orders, then email one receipt",
@@ -129,31 +102,180 @@ Other commands: `planbound pending`, `planbound approve <plan_id>`, `planbound d
                      "total": {"$agg": {"fn": "sum", "of": "eligible", "field": "amount"}}}}}
  ]}
 ```
+</details>
 
-With `"max_items": 50`, the compiler refuses: *worst case 500,000 is above the per-plan limit
-200,000; lower max_items to at most 20.*
+## When something fails
 
-## What's built, and what isn't
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent
+    participant P as Planbound
+    participant B as Billing
+    participant E as Email
+    A->>P: one plan: N refunds, then 1 email
+    P->>B: refunds 1 … N-1 (each journaled first)
+    P->>B: refund N
+    B--xP: declined
+    P->>B: cancel N-1 … 1 (newest first, retried)
+    Note over P,E: the email is the point of no return, so it never ran
+    P-->>A: failed_compensated · nothing changed
+```
 
-Built and tested: compiler and diagnostics, effects manifest (state × egress, labels, trust,
-identity, hash pinning, dev-mode inference and drafting), preview and stale check, three approval
-tiers with Ed25519 and a budget ledger with holds, saga executor with compensation, retries and
-crash recovery and reconciliation (fault-injection tests for failing undo steps, crashes during
-rollback, lost answers and concurrent writers), conditional writes, plan leases and fencing tokens,
-background reconciliation, multi-stage plans (`checkpoint`), handles and deterministic summaries,
-display sink, MCP gateway and CLI.
+Crashes, lost answers, a stalled gateway and an undo service that is down are all handled too, and
+each has a fault-injection test: see [What it guarantees](#what-it-guarantees).
 
-Real-model benchmark: `bench/live.py` runs the task with a real Claude model, directly over MCP and
-through Planbound, and checks the Claude-backed quarantined reader against the live API. Its loop is
-tested offline; its numbers need your API credentials (results go to `bench/LIVE_RESULTS.md`).
+## Fast enough to use by default
 
-Read [SPEC.md](SPEC.md) for the full design and its limits.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/demo/latency-dark.svg">
+  <img alt="Modeled latency: Direct MCP 5.4s, code mode 4.6s, Planbound JSON plan 7.4s, Planbound script 4.6s, Planbound prepared 2.2s" src="docs/demo/latency-light.svg" width="760">
+</picture>
+
+| Refund 40 orders, email one receipt | Direct MCP | Code mode | Planbound · script | Planbound · prepared |
+|---|---|---|---|---|
+| LLM turns | 4 | 2 | 2 | 2 |
+| Tokens the model reads | 8,213 | **1,497** | 1,873 | 1,766 |
+| Tokens the model writes | 136 | 179 | 187 | **43** |
+| Injected note reaches the model | ❌ yes | ⚠️ only if the script prints it | ✅ never | ✅ never |
+| One refund fails mid-batch | ❌ 1 refund left done | ❌ 1 refund left done | ✅ nothing changed | ✅ nothing changed |
+| Modeled latency | 5.4s | 4.6s | 4.6s | **2.2s** |
+
+<sub>Simulated model, real MCP calls; direct calling gets every advantage (parallel calls, server-side
+filters). The prepared row is a repeat run. Full tables: <a href="bench/RESULTS.md">bench/RESULTS.md</a>.
+<code>bench/live.py</code> measures the same with a real Claude model.</sub>
+
+## What it guarantees
+
+<details open>
+<summary><b>🛡️ What the model can see, and what it can do</b></summary>
+
+| Risk | What Planbound does |
+|---|---|
+| Prompt injection through tool output | Untrusted text never reaches the model; it gets counts, sums, ids |
+| A quarantined reader steered by injected text | Several readers must agree, and writes driven by a reader always need a human |
+| Poisoned or changed tool descriptions | Tool contracts are hash-pinned; the model sees operator-reviewed descriptions |
+| Acting on the wrong person | Identity binding: `employee_id` must be `caller.employee_id` |
+| Approval fatigue, or the agent approving itself | A budget policy signs (Ed25519, separate process); humans only at the edge |
+| Many small plans to dodge a limit | The signer keeps a rolling budget with authorization holds |
+</details>
+
+<details>
+<summary><b>💸 How much it touches</b></summary>
+
+| Risk | What Planbound does |
+|---|---|
+| "How much will this touch?" | Every `map` declares `max_items`; per-call and per-plan cost limits, checked statically and on real data |
+| Two irreversible actions half-done | Compile error: at most one point of no return, after every undoable step |
+| A refund visible before it is rolled back | Reservations (`confirm`): held invisibly, confirmed only past the point of no return |
+| An email sent too soon | `hold_seconds`: a cancel window before irreversible steps (`planbound cancel`) |
+| Money moving without upstream guarantees | `strict_writes`: sensitive tools must declare idempotency keys, conditional writes and fencing |
+| An upstream that only *claims* those guarantees | `planbound verify` tests each claim; `require_verified` demands proof |
+</details>
+
+<details>
+<summary><b>↺ When things go wrong</b></summary>
+
+| Risk | What Planbound does |
+|---|---|
+| Refund #17 fails after #1–16 ran | Automatic compensation in reverse order |
+| An undo step fails during rollback | Retried with backoff; `planbound recover` keeps retrying later |
+| An undo service down for hours | Background reconciliation finishes the rollback when it is back; alerts if it stays stuck |
+| Starting writes while the undo service is down | `undo_probe`: the plan does not start |
+| A write gets no answer | Re-sent only if that cannot repeat it; `outcome_check` asks the server; otherwise a person decides, never a guess |
+| Gateway crash mid-plan | SQLite journal + idempotency keys; `planbound recover` compensates or rolls forward |
+</details>
+
+<details>
+<summary><b>⏱️ Races and concurrency</b></summary>
+
+| Risk | What Planbound does |
+|---|---|
+| Data changed while waiting for approval | The commit re-reads; a mismatch stops with `E_PREVIEW_STALE`, nothing written |
+| Data changes between the re-read and the write | `conditional` writes carry the version read earlier; the server refuses → rolled back |
+| `recover` racing a live gateway, or two commits of one plan | Plan leases: one driver at a time |
+| A stalled gateway waking up after recovery took over | Fencing tokens: the journal and fencing-aware servers refuse the old holder |
+| Investigations that decide what to look at next | Multi-stage plans: each stage continues from earlier results with `checkpoint` |
+</details>
+
+Some limits cannot be removed by any gateway (an email cannot be unsent). [SPEC.md §6](SPEC.md)
+lists each one next to the defence that handles it.
+
+## Quick start
+
+```bash
+uv sync --all-groups
+uv run pytest -q                  # 127 tests, incl. fault injection
+uv run python -m bench.run        # writes bench/RESULTS.md
+uv run python -m bench.demo_setup # writes demo/: config, pinned manifest, signing keys
+```
+
+Run the gateway (point any MCP client at it) and the policy signer in another terminal:
+
+```bash
+uv run planbound --config demo/planbound.config.json serve
+```
+
+```bash
+uv run planbound --config demo/planbound.config.json signer --keys demo/keys --budget 50000
+```
+
+<details>
+<summary><b>Agent tools and CLI commands</b></summary>
+
+**Tools the agent sees:** `planbound_search_tools`, `planbound_submit_plan` (script or JSON),
+`planbound_prepare`, `planbound_run`, `planbound_commit`, `planbound_cancel`,
+`planbound_inspect_handle`.
+
+| Command | What it does |
+|---|---|
+| `planbound serve` | Run the gateway as an MCP server on stdio |
+| `planbound signer --budget N` | Run the policy signer (separate process, holds the private keys) |
+| `planbound pending` · `approve <id>` · `deny <id>` | Human approval for escalated plans |
+| `planbound cancel <id>` | Stop a plan before its point of no return; what ran is undone |
+| `planbound recover [--watch]` | Reconcile every unfinished plan: retry undo steps, compensate or roll forward |
+| `planbound resolve <id> <step> --happened\|--did-not-happen` | Record what a person found upstream for an unknown write |
+| `planbound abandon <id> --reason ...` | Close a plan recovery cannot finish |
+| `planbound stuck` | List plans stuck in `failed_partial` or `needs_attention` |
+| `planbound verify <tool> --args JSON` | Test the guarantees a tool claims, against a sandbox |
+| `planbound draft` | Draft a manifest from the tools used in dev mode |
+| `planbound show h://plan/node` | Print a handle's raw data for a human (never sent to the model) |
+| `planbound keys` | Create the policy and human signing keys |
+
+Gateway config options (`runtime`, `alerts`) are in [SPEC.md §4](SPEC.md).
+</details>
+
+## Project status
+
+**v0.1, built and tested:**
+- compiler and diagnostics, plan scripts and prepared plans;
+- effects manifest (hash pinning, labels, identity, verification);
+- preview, three approval tiers, budget ledger;
+- saga executor with reservations, compensation, reconciliation, leases and fencing;
+- multi-stage plans, deterministic summaries, MCP gateway and CLI.
+
+Each failure mode has a fault-injection test that goes through the real MCP path.
+
+Not yet measured: numbers from a real model. `uv run --extra reader python -m bench.live` produces
+them, and checks the Claude-backed quarantined reader against the live API, once you have API
+credentials.
+
+Read [SPEC.md](SPEC.md) for the full design.
+
+<details>
+<summary><b>Regenerating the demo and chart</b></summary>
+
+```bash
+uv run python -m docs.demo.make_demo   # docs/demo/planbound.gif, from a real run
+uv run python -m bench.run && uv run python -m docs.demo.make_chart   # docs/demo/latency-*.svg
+```
+</details>
 
 ## Prior art
 
 CaMeL ([arXiv 2503.18813](https://arxiv.org/abs/2503.18813)) and FIDES
 ([arXiv 2505.23643](https://arxiv.org/abs/2505.23643)) separate control from data and track
-information flow; SPA ([arXiv 2608.27234](https://arxiv.org/abs/2608.27234)) checks a declarative
+information flow. SPA ([arXiv 2608.27234](https://arxiv.org/abs/2608.27234)) checks a declarative
 plan before running it. MCPTox ([arXiv 2508.14925](https://arxiv.org/abs/2508.14925)) measured
 tool-poisoning attacks on real MCP servers. Undolith, Holdpoint, Countersign and glasshouse gate,
 queue or undo individual agent actions. Planbound packages plan-level previews, budgets and saga

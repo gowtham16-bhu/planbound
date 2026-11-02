@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="284" viewBox="0 0 760 284" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<text x="0" y="20" font-size="16" font-weight="600" fill="#e6edf3">Modeled latency: refund 40 orders, email one receipt</text>
+<text x="0" y="40" font-size="12" fill="#9198a1">simulated model, real MCP calls · output tokens on the right · lower is better</text>
+<text x="178" y="71.68" font-size="13" text-anchor="end" font-weight="400" fill="#e6edf3">Direct MCP</text>
+<rect x="190" y="54" width="306.6" height="26" rx="5" fill="#6e7681"/>
+<text x="504.6" y="71.68" font-size="13" font-weight="600" fill="#e6edf3">5.4s</text>
+<text x="756" y="71.68" font-size="12" text-anchor="end" fill="#9198a1">136 tok out</text>
+<text x="178" y="111.68" font-size="13" text-anchor="end" font-weight="400" fill="#e6edf3">Code mode</text>
+<rect x="190" y="94" width="259.9" height="26" rx="5" fill="#6e7681"/>
+<text x="457.9" y="111.68" font-size="13" font-weight="600" fill="#e6edf3">4.6s</text>
+<text x="756" y="111.68" font-size="12" text-anchor="end" fill="#9198a1">179 tok out</text>
+<text x="178" y="151.68" font-size="13" text-anchor="end" font-weight="600" fill="#e6edf3">Planbound · JSON plan</text>
+<rect x="190" y="134" width="420.0" height="26" rx="5" fill="#4493f8"/>
+<text x="618.0" y="151.68" font-size="13" font-weight="600" fill="#e6edf3">7.4s</text>
+<text x="756" y="151.68" font-size="12" text-anchor="end" fill="#9198a1">348 tok out</text>
+<text x="178" y="191.68" font-size="13" text-anchor="end" font-weight="600" fill="#e6edf3">Planbound · script</text>
+<rect x="190" y="174" width="261.0" height="26" rx="5" fill="#4493f8"/>
+<text x="459.0" y="191.68" font-size="13" font-weight="600" fill="#e6edf3">4.6s</text>
+<text x="756" y="191.68" font-size="12" text-anchor="end" fill="#9198a1">187 tok out</text>
+<text x="178" y="231.68" font-size="13" text-anchor="end" font-weight="600" fill="#e6edf3">Planbound · prepared</text>
+<rect x="190" y="214" width="123.7" height="26" rx="5" fill="#3fb950"/>
+<text x="321.7" y="231.68" font-size="13" font-weight="600" fill="#e6edf3">2.2s</text>
+<text x="756" y="231.68" font-size="12" text-anchor="end" fill="#9198a1">43 tok out</text>
+</svg>

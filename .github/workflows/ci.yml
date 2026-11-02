@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --all-groups --locked
+      - name: Lint
+        run: uv run ruff check src tests bench docs
+      - name: Tests (incl. fault injection)
+        run: uv run pytest -q
+      - name: Benchmark still runs
+        run: uv run python -m bench.run > /dev/null
