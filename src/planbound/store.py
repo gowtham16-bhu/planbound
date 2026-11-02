@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS plans (
     preview_json TEXT,
     result_json  TEXT,
     created_at   REAL NOT NULL,
-    updated_at   REAL NOT NULL
+    updated_at   REAL NOT NULL,
+    lease_owner  TEXT,
+    lease_until  REAL
 );
 CREATE TABLE IF NOT EXISTS handles (
     plan_id     TEXT NOT NULL,
@@ -50,6 +52,7 @@ CREATE TABLE IF NOT EXISTS journal (
     updated_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS journal_plan ON journal(plan_id);
+CREATE INDEX IF NOT EXISTS journal_key ON journal(idem_key);
 CREATE TABLE IF NOT EXISTS approvals (
     plan_id      TEXT PRIMARY KEY,
     plan_hash    TEXT NOT NULL,
@@ -79,6 +82,10 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(plans)")}
+        for col, kind in (("lease_owner", "TEXT"), ("lease_until", "REAL")):
+            if col not in cols:  # databases created before leases existed
+                self.db.execute(f"ALTER TABLE plans ADD COLUMN {col} {kind}")
 
     def close(self) -> None:
         self.db.close()
@@ -88,8 +95,9 @@ class Store:
     def create_plan(self, plan_id: str, plan_hash: str, raw: dict, caller: dict) -> None:
         now = time.time()
         self.db.execute(
-            "INSERT INTO plans VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (plan_id, plan_hash, json.dumps(raw), json.dumps(caller), "compiled", None, None, None, now, now),
+            "INSERT INTO plans VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (plan_id, plan_hash, json.dumps(raw), json.dumps(caller), "compiled", None, None, None, now, now,
+             None, None),
         )
 
     def update_plan(self, plan_id: str, **fields: Any) -> None:
@@ -100,6 +108,8 @@ class Store:
                 key, value = f"{key}_json", json.dumps(value)
             cols.append(f"{key} = ?")
             vals.append(value)
+        if "status" in fields and fields["status"] != "running" and "lease_owner" not in fields:
+            cols.append("lease_owner = NULL")  # the plan stopped: whoever ran it lets go
         cols.append("updated_at = ?")
         vals.extend([time.time(), plan_id])
         self.db.execute(f"UPDATE plans SET {', '.join(cols)} WHERE plan_id = ?", vals)
@@ -115,6 +125,31 @@ class Store:
             val = out.pop(f"{key}_json")
             out[key] = json.loads(val) if val else None
         return out
+
+    # ---------------------------------------------------------------- leases
+    #
+    # Only one gateway (or `planbound recover`) may drive a plan at a time. The holder renews its lease
+    # before every write; a lease that is not renewed expires, and then recovery may take the plan over.
+
+    def claim(self, plan_id: str, owner: str, ttl_s: float, statuses: tuple[str, ...], *,
+              new_status: str | None = None) -> bool:
+        """Atomically take the plan if it is in one of `statuses` and nobody else holds a live lease."""
+        now = time.time()
+        q = ",".join("?" for _ in statuses)
+        sets = "lease_owner = ?, lease_until = ?, updated_at = ?" + (", status = ?" if new_status else "")
+        vals: list[Any] = [owner, now + ttl_s, now] + ([new_status] if new_status else [])
+        cur = self.db.execute(
+            f"UPDATE plans SET {sets} WHERE plan_id = ? AND status IN ({q})"
+            " AND (lease_owner IS NULL OR lease_until < ? OR lease_owner = ?)",
+            [*vals, plan_id, *statuses, now, owner],
+        )
+        return cur.rowcount == 1
+
+    def renew(self, plan_id: str, owner: str, ttl_s: float) -> bool:
+        """Extend our lease. False means someone else took the plan over: stop touching it."""
+        cur = self.db.execute("UPDATE plans SET lease_until = ? WHERE plan_id = ? AND lease_owner = ?",
+                              (time.time() + ttl_s, plan_id, owner))
+        return cur.rowcount == 1
 
     def plans_with_status(self, *statuses: str) -> list[str]:
         q = ",".join("?" for _ in statuses)
@@ -164,18 +199,15 @@ class Store:
             (status, json.dumps(result) if result is not None else None, error, time.time(), seq),
         )
 
+    def journal_find(self, idem_key: str) -> dict | None:
+        """The journal entry for one write (plan:node:item), if it was ever attempted."""
+        row = self.db.execute("SELECT * FROM journal WHERE idem_key = ? ORDER BY seq DESC LIMIT 1",
+                              (idem_key,)).fetchone()
+        return _journal_row(row) if row else None
+
     def journal(self, plan_id: str) -> list[dict]:
         rows = self.db.execute("SELECT * FROM journal WHERE plan_id = ? ORDER BY seq", (plan_id,))
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["args"] = json.loads(d.pop("args_json"))
-            res = d.pop("result_json")
-            d["result"] = json.loads(res) if res else None
-            comp = d.pop("compensator_json")
-            d["compensator"] = json.loads(comp) if comp else None
-            out.append(d)
-        return out
+        return [_journal_row(r) for r in rows]
 
     # ---------------------------------------------------------------- approvals
 
@@ -212,3 +244,13 @@ class Store:
 
     def used_tools(self) -> list[str]:
         return [r[0] for r in self.db.execute("SELECT tool FROM usage ORDER BY tool")]
+
+
+def _journal_row(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["args"] = json.loads(d.pop("args_json"))
+    res = d.pop("result_json")
+    d["result"] = json.loads(res) if res else None
+    comp = d.pop("compensator_json")
+    d["compensator"] = json.loads(comp) if comp else None
+    return d

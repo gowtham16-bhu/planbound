@@ -36,8 +36,19 @@ def main(argv: list[str] | None = None) -> None:
         a.add_argument("--keys", default=".planbound/keys")
         a.add_argument("--yes", action="store_true")
     sub.add_parser("pending", help="list approval requests waiting for the signer or a human")
-    sub.add_parser("recover", help="compensate or finish plans a crashed gateway left running")
+    sub.add_parser("recover", help="reconcile plans that did not end cleanly: retry failed undo steps, "
+                                   "compensate or finish crashed plans")
+    r = sub.add_parser("resolve", help="record what happened to a write whose outcome was unknown")
+    r.add_argument("plan_id")
+    r.add_argument("step", help="the step as reported, e.g. refunds[3]")
+    g = r.add_mutually_exclusive_group(required=True)
+    g.add_argument("--happened", action="store_true", help="the write did happen upstream")
+    g.add_argument("--did-not-happen", action="store_true", help="the write did not happen upstream")
+    r.add_argument("--result", help="the tool's result as JSON, so the step can be undone")
     sub.add_parser("draft", help="draft a manifest from the tools actually used in dev mode")
+    ab = sub.add_parser("abandon", help="close a plan recovery cannot finish; nothing upstream is touched")
+    ab.add_argument("plan_id")
+    ab.add_argument("--reason", required=True, help="why, for the record (e.g. 'refund reversed by finance')")
     sh = sub.add_parser("show", help="print a handle's raw data for a human (never sent to the model)")
     sh.add_argument("handle")
     args = p.parse_args(argv)
@@ -68,6 +79,21 @@ def main(argv: list[str] | None = None) -> None:
             print(describe_request(req), end="\n\n")
     elif args.cmd == "recover":
         print(json.dumps(asyncio.run(_recover(cfg)), indent=2))
+    elif args.cmd == "resolve":
+        store = Store(cfg.db_path)
+        rt = Runtime(store, _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},
+                     **(cfg.runtime or {}))
+        out = rt.resolve(args.plan_id, args.step, args.happened, json.loads(args.result) if args.result else None)
+        print(json.dumps(out, indent=2))
+        if out["status"] == "error":
+            sys.exit(1)
+    elif args.cmd == "abandon":
+        rt = Runtime(Store(cfg.db_path), _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},
+                     **(cfg.runtime or {}))
+        out = rt.abandon(args.plan_id, args.reason)
+        print(json.dumps(out, indent=2))
+        if out["status"] == "error":
+            sys.exit(1)
     elif args.cmd == "draft":
         out = asyncio.run(_draft(cfg))
         print(f"Draft written to {out}. Review every entry before using it in enforce mode.")
@@ -92,10 +118,20 @@ def _signer(cfg: GatewayConfig, args) -> None:
         time.sleep(0.5)
 
 
+class _NoUpstreams:
+    """`resolve` and `abandon` only edit the journal; they never call a tool."""
+
+    def __init__(self) -> None:
+        self.catalog: dict = {}
+
+    async def call(self, tool, args, meta=None):
+        raise RuntimeError("resolve does not call upstream tools")
+
+
 async def _recover(cfg: GatewayConfig) -> list[dict]:
     async with MCPUpstreams(cfg.servers) as up:
         rt = Runtime(Store(cfg.db_path), up, Manifest.load(cfg.manifest_path), cfg.caller or {},
-                     reader=make_reader(cfg.reader))
+                     reader=make_reader(cfg.reader), **(cfg.runtime or {}))
         return await rt.recover()
 
 

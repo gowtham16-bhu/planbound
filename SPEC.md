@@ -65,7 +65,17 @@ Owned by the operator. Server annotations are hints; only this file is trusted (
 | `cost`, `limits` | `$input.<field>` cost per call; `max_per_call`, `max_per_plan` |
 | `identity` | The argument must be `{"$caller": "<attr>"}` (the signed-in user, set by the host, never by the model) unless the caller has `unless_role` |
 | `requires_approval` | Always send plans using this tool to the policy signer |
-| `idempotency_keys` | Whether the upstream honours `io.planbound/idempotency-key` (default true) |
+| `idempotency_keys` | The operator confirms the upstream honours `io.planbound/idempotency-key` (default **false**). Without it a write that gets no answer is never re-sent; it becomes `UNKNOWN` |
+| `conditional` | `{"arg": "expected_version", "conflict_pattern"?: "<regex>"}`: the upstream refuses the write if `arg` no longer matches. The plan must fill `arg` from a read (`$ref`/`$item`), else `E_CONDITIONAL_REQUIRED`; a refusal matching the pattern fails the step with `E_WRITE_CONFLICT` and the plan rolls back |
+| `compensator` | The undo call. Its tool must be listed and be `idempotent_write` or declare `idempotency_keys: true`, because rollback retries it; otherwise the manifest does not load |
+| `confirm_read_only` | Needed to mark a tool `read_only` when its name says it writes (`refund_`, `send_`, `delete_`, …); otherwise the manifest does not load |
+
+**`defaults.strict_writes`.** When true, every *sensitive* write (one with a `cost` or
+`requires_approval`) must declare both `idempotency_keys: true` and `conditional`, or the plan fails
+with `E_UNSAFE_WRITE`. Turn it on for anything that moves money.
+
+**Hint conflicts.** A tool the manifest calls `read_only` but the server annotates `destructiveHint`
+is refused with `E_EFFECTS_CONFLICT`.
 
 **Modes.** `enforce`: unlisted tools are rejected. `dev`: effects are inferred conservatively
 (read-like names or `readOnlyHint` → `read_only`; a `cancel_/delete_/undo_` partner → `compensatable`;
@@ -108,7 +118,8 @@ All errors come back together with `code`, `node_id`, JSON `path`, `message` and
 `E_CYCLE` `E_UNKNOWN_FIELD` (lists available fields) `E_ITEM_OUTSIDE_MAP` `E_UNKNOWN_CALLER_ATTR`
 `E_BAD_AGG` `E_MISSING_MAP_BOUND` `E_QUARANTINE_SCHEMA` `E_QUARANTINE_READER_UNCONFIGURED`
 `E_IDENTITY` `E_LABEL_FLOW` `E_WHEN_ON_WRITE` `E_MULTIPLE_PIVOTS` `E_IRREVERSIBLE_NOT_TERMINAL`
-`E_SAGA_ORDER` `E_COST_BOUND` (suggests a smaller `max_items`).
+`E_SAGA_ORDER` `E_COST_BOUND` (suggests a smaller `max_items`) `E_CONDITIONAL_REQUIRED`
+`E_UNSAFE_WRITE` `E_EFFECTS_CONFLICT`.
 
 **Saga shape** (enforced here, not hoped for at runtime):
 `compensatable steps → at most one irreversible pivot → idempotent_write steps`.
@@ -137,13 +148,50 @@ is rejected; a second irreversible step needs `allow_partial_irreversible`.
    written. (With Tier 1, no time passes, so the preview's reads are reused.)
 5. **Execute.** Waves in the saga order, map items in parallel. Before each write the journal
    records it (`IN_FLIGHT`, fsynced SQLite WAL), and the call carries the idempotency key
-   `plan:node:item`. `idempotent_write` calls are retried.
-6. **Failure.** Before the pivot: compensators run newest first → `failed_compensated`
-   (or `failed_partial` if one fails). After the pivot: `failed_partial`; `planbound recover`
-   retries the remaining retry-safe steps.
-7. **Crash recovery** (`planbound recover`). `IN_FLIGHT` writes are re-sent with the same
-   idempotency key to learn their outcome. Pivot not reached → compensate → `recovered_compensated`.
-   Pivot done → roll forward. Pivot outcome unknown → `needs_attention` (never guessed).
+   `plan:node:item`. Errors come in two kinds. A *definite* error (the server answered "no") means
+   the write did not happen; only `idempotent_write` calls are retried on it. *No answer* (timeout,
+   dropped connection) means it may have happened: the call is re-sent with the same key only if
+   re-sending cannot repeat it (`idempotent_write`, or `idempotency_keys: true`); otherwise the step
+   is journaled `UNKNOWN`. A conditional write refused because the data changed → `E_WRITE_CONFLICT`.
+6. **Failure.** The *point of no return* is passed once the pivot or any `idempotent_write` step
+   has completed (those are never undone). Before it: compensators run newest first, each retried
+   with backoff (`compensation_attempts`, default 5) → `failed_compensated`; an undo that still fails
+   is journaled `COMPENSATION_FAILED` → `failed_partial`, and `planbound recover` retries it. After
+   it: `failed_partial`; `planbound recover` finishes the remaining retry-safe steps. Any `UNKNOWN`
+   step → `needs_attention`, listing the steps (undoable steps known to have happened are still
+   compensated when the pivot was not reached).
+7. **Reconciliation** (`planbound recover`). Runs over every plan that is `running` (crash),
+   `failed_partial` or `needs_attention`, and is safe to repeat. `IN_FLIGHT` writes are re-sent with
+   the same key where that is safe, else marked `UNKNOWN`. Then: pivot outcome unknown →
+   `needs_attention`, nothing compensated (never guessed). Pivot not reached → compensate →
+   `recovered_compensated`. Past it → roll forward; a write already `COMPLETED` in the journal is
+   replayed from the journal, never re-sent. Rolling forward never starts an irreversible step that
+   had not run. `planbound resolve <plan> <node[i]> --happened|--did-not-happen [--result JSON]`
+   records what a human found upstream for an `UNKNOWN` step; the next `recover` continues from it.
+   The policy signer releases a finalized budget hold once a plan is fully compensated.
+   `planbound abandon <plan> --reason "..."` closes a `failed_partial` or `needs_attention` plan that
+   recovery cannot finish (for example a second irreversible step it will not start long after
+   approval). Nothing upstream is touched; the result lists what was left as is, and `recover` no
+   longer picks it up.
+8. **Leases.** One process drives a plan at a time. Commit claims the plan atomically
+   (`previewed`/`awaiting_approval` → `running`), so two commits of one plan run it once. The holder
+   renews a lease (`runtime.lease_seconds` in the gateway config, default 60s) before every write and every undo step. `recover`
+   only takes plans whose lease has expired, so it never compensates a plan a live gateway is still
+   running; a gateway that finds its lease taken stops at once (`LeaseLost`).
+
+**Gateway config `runtime` section** (optional; used by `serve`, `recover`, `resolve`, `abandon`):
+
+```json
+"runtime": {"lease_seconds": 60, "retry_attempts": 3, "compensation_attempts": 5}
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `lease_seconds` | 60 (1–86400) | Lease length. Longer than your slowest upstream write; shorter than you will wait for `recover` to take over a dead gateway |
+| `retry_attempts` | 3 (1–20) | Attempts per write: definite errors for `idempotent_write`, lost answers where re-sending is safe |
+| `compensation_attempts` | 5 (1–50) | Attempts per undo step during one rollback, with exponential backoff |
+
+Unknown options and out-of-range values stop the gateway from starting.
 
 ---
 
@@ -163,7 +211,15 @@ views under the same rules. Trusted sources and `display` receipts are the only 
 - **Classification can be steered.** A quarantined reader can only return closed types, so injected
   text cannot add actions, but a crafted text can still pick a wrong category. Bounds and budgets stay.
 - **Upstream support matters.** Without idempotency keys or conditional writes, a small race window
-  remains between the commit re-read and the write.
+  remains between the commit re-read and the write, and a lost answer needs a human. Planbound can
+  require them (`strict_writes`) but cannot make a server honour what it claims to.
+- **Rollback can still be stuck.** Undo steps are retried and reconciled, but if a compensator keeps
+  failing the plan stays `failed_partial` until the upstream recovers or a human steps in.
+- **Leases are not fencing.** A gateway that stalls longer than `lease_seconds` *between* renewing and
+  sending a write can still send it after recovery took over. Recovery then sees the write as in
+  flight and handles it like a crash. Closing that gap needs upstreams that check a fencing token.
+- **The manifest is trusted.** The load-time and hint checks catch obvious mislabels, not a
+  write tool with a read-like name and no annotations.
 - **Approval channel.** The gateway only holds public keys, but the policy signer and the human
   must run where the agent cannot reach their private keys.
 - **Identity comes from the host.** v0.1 reads the caller from config or `PLANBOUND_CALLER`.

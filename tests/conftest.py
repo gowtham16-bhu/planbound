@@ -16,7 +16,10 @@ class Env:
     def runtime(self, manifest, caller=None, **kw) -> Runtime:
         kw.setdefault("display_dir", self.tmp / "display")
         kw.setdefault("retry_delay_s", 0.0)
-        return Runtime(self.store, self.up, manifest, caller or {"user": "ops"}, **kw)
+        # A crashed runtime's lease would otherwise block the "restarted" one for a minute.
+        kw.setdefault("lease_ttl_s", 0.0)
+        upstreams = kw.pop("upstreams", self.up)
+        return Runtime(self.store, upstreams, manifest, caller or {"user": "ops"}, **kw)
 
 
 @pytest.fixture

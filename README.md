@@ -35,6 +35,11 @@ Agent ──plan──► Planbound: Check ─► Preview ─► Approve ─► 
 | Many small plans to dodge a limit | The signer keeps a rolling budget with authorization holds |
 | Acting on the wrong employee | Identity binding: `employee_id` must be `{"$caller": "employee_id"}` |
 | Gateway crash mid-plan | SQLite journal + idempotency keys; `planbound recover` compensates or rolls forward |
+| An undo step fails during rollback | Retried with backoff; still failing → `failed_partial`, and `planbound recover` retries it later |
+| A write gets no answer | Re-sent with the same key only if that can't repeat it; otherwise `needs_attention` and `planbound resolve`, never a guess |
+| Data changes between the re-read and the write | `conditional` writes pass the version read earlier; the server refuses → `E_WRITE_CONFLICT`, rolled back |
+| `recover` racing a live gateway, or two commits of one plan | Plan leases: one driver at a time; recover only takes plans whose lease expired |
+| Money moving without upstream guarantees | `strict_writes`: sensitive tools must declare idempotency keys and a conditional write |
 
 ## Benchmark (real MCP calls, simulated model)
 
@@ -44,7 +49,7 @@ Direct calling gets every advantage (parallel tool calls, server-side status fil
 | | Direct MCP | Code mode | Planbound |
 |---|---|---|---|
 | LLM turns | 4 | 2 | **2** |
-| Tokens the model reads | 7,927 | 1,442 | 3,195 |
+| Tokens the model reads | 8,213 | 1,497 | 3,223 |
 | Tokens the model writes | 136 | 179 | 348 |
 | Untrusted text in the model's context (injected note) | 227 tok, **incl. injection** | 0 (this script didn't print it) | **0 (by construction)** |
 | One refund fails mid-batch | **1 refund left done** | **1 refund left done** | **nothing changed** |
@@ -60,10 +65,13 @@ simulated; run against a real model before quoting latency.
 
 ```bash
 uv sync --all-groups
-uv run pytest -q                     # 41 tests
+uv run pytest -q                     # 71 tests, incl. fault injection
 uv run python -m bench.run           # writes bench/RESULTS.md
 uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys
 ```
+
+The demo config includes the optional `runtime` section (`lease_seconds`, `retry_attempts`,
+`compensation_attempts`); see [SPEC.md](SPEC.md) §4.
 
 Run the gateway (point any MCP client at it) and the policy signer in another terminal:
 
@@ -76,7 +84,8 @@ uv run planbound --config demo/planbound.config.json signer --keys demo/keys --b
 ```
 
 Other commands: `planbound pending`, `planbound approve <plan_id>`, `planbound deny <plan_id>`,
-`planbound recover`, `planbound draft` (manifest from dev-mode usage), `planbound show h://plan/node`
+`planbound recover` (reconcile every unfinished plan), `planbound resolve <plan_id> <step> --happened|--did-not-happen`, `planbound abandon <plan_id> --reason ...`,
+`planbound draft` (manifest from dev-mode usage), `planbound show h://plan/node`
 (raw data for a human), `planbound keys`.
 
 ## A plan
@@ -109,7 +118,8 @@ With `"max_items": 50`, the compiler refuses: *worst case 500,000 is above the p
 Built and tested: compiler and diagnostics, effects manifest (state × egress, labels, trust,
 identity, hash pinning, dev-mode inference and drafting), preview and stale check, three approval
 tiers with Ed25519 and a budget ledger with holds, saga executor with compensation, retries and
-crash recovery, handles and deterministic summaries, display sink, MCP gateway and CLI.
+crash recovery and reconciliation (fault-injection tests for failing undo steps, crashes during
+rollback, lost answers and concurrent writers), conditional writes, handles and deterministic summaries, display sink, MCP gateway and CLI.
 
 Not yet verified: the Claude-backed quarantined reader (`planbound.reader.AnthropicReader`) has not
 been run against the live API here; tests use a deterministic reader. `checkpoint` is reserved for v0.2.

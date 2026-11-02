@@ -38,6 +38,7 @@ class MCPUpstreams:
                     input_schema=tool.input_schema or {},
                     output_schema=tool.output_schema,
                     read_only_hint=bool(tool.annotations and tool.annotations.read_only_hint),
+                    destructive_hint=bool(tool.annotations and tool.annotations.destructive_hint),
                 )
         return self
 
@@ -49,7 +50,10 @@ class MCPUpstreams:
         client = self._clients.get(server)
         if client is None:
             raise UpstreamError(f"unknown server {server!r}")
-        result = await client.call_tool(name, args, meta=meta)
+        try:
+            result = await client.call_tool(name, args, meta=meta)
+        except Exception as e:  # transport failure: the request may or may not have arrived
+            raise UpstreamError(f"{tool}: no response ({type(e).__name__}: {e})", definite=False) from e
         text = "".join(getattr(c, "text", "") for c in result.content or [])
         if result.is_error:
             raise UpstreamError(text or "tool returned an error")

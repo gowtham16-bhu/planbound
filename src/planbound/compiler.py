@@ -287,6 +287,11 @@ def compile_plan(
                 f"Tool {tool_name!r} changed (name, description or schema) since the operator reviewed it.",
                 "The operator must re-review the tool and update contract_sha256.")
             continue
+        if eff.state == "read_only" and tool.destructive_hint:
+            err("E_EFFECTS_CONFLICT", node, args_suffix.replace(".args", ".tool"),
+                f"The manifest says {tool_name!r} is read_only, but the server marks it destructive.",
+                "The operator must check the tool and correct the effects manifest.")
+            continue
         ni.tool, ni.effects, ni.state = tool_name, eff, eff.state
         ni.kind = "read" if eff.state == "read_only" else "write"
         ni.trust = eff.output_trust
@@ -303,6 +308,26 @@ def compile_plan(
                     f"Tool {tool_name!r} may only act on the caller's own record.",
                     f"Set \"{arg}\": {canonical(want)}. Acting on others needs role "
                     f"{eff.identity.get('unless_role')!r}.")
+        if eff.conditional:
+            carg = eff.conditional["arg"]
+            value = args.get(carg)
+            if not (isinstance(value, dict) and ("$ref" in value or "$item" in value)):
+                err("E_CONDITIONAL_REQUIRED", node, f"{args_suffix}.{carg}",
+                    f"Tool {tool_name!r} is a conditional write: {carg!r} must carry the value read earlier "
+                    "in this plan, so the server can refuse the write if it changed since.",
+                    f"Set \"{carg}\" to a {{\"$ref\"}} or {{\"$item\"}} from the read that produced it.")
+        if manifest.strict_writes and eff.sensitive:
+            missing = []
+            if not eff.idempotency_keys:
+                missing.append("idempotency keys")
+            if eff.conditional is None:
+                missing.append("a conditional write")
+            if missing:
+                err("E_UNSAFE_WRITE", node, args_suffix.replace(".args", ".tool"),
+                    f"Strict writes: {tool_name!r} moves money or needs approval, but the manifest does not "
+                    f"declare {' or '.join(missing)} for it.",
+                    "The operator must confirm the upstream supports them (idempotency_keys, conditional) "
+                    "or turn off defaults.strict_writes.")
 
     if diags:
         raise CompileError(diags)

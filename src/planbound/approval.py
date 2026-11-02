@@ -133,12 +133,21 @@ class PolicySigner:
         return float(row[0])
 
     def sync_outcomes(self) -> None:
-        """Finalize holds for plans that completed; release holds for plans that did not run."""
-        for plan_id, in self.ledger.execute("SELECT plan_id FROM holds WHERE status = 'reserved'").fetchall():
+        """Finalize holds for plans that completed; release holds for plans that did not run.
+
+        A partial plan's hold is finalized (the money may be gone), and released again if a later
+        `planbound recover` rolls it back completely.
+        """
+        rows = self.ledger.execute("SELECT plan_id, status FROM holds WHERE status IN ('reserved', 'finalized')")
+        for plan_id, hold in rows.fetchall():
             plan = self.gateway.get_plan(plan_id)
             approval = self.gateway.get_approval(plan_id)
             status = plan["status"] if plan else "missing"
-            if status in ("completed", "failed_partial", "needs_attention"):
+            if hold == "finalized":
+                if status in ("failed_compensated", "recovered_compensated"):
+                    self._set_hold(plan_id, "released")
+                continue
+            if status in ("completed", "failed_partial", "needs_attention", "abandoned"):
                 self._set_hold(plan_id, "finalized")
             elif status in ("failed_compensated", "recovered_compensated", "stale", "rejected", "missing"):
                 self._set_hold(plan_id, "released")
