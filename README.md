@@ -65,10 +65,13 @@ simulated; run against a real model before quoting latency.
 
 ```bash
 uv sync --all-groups
-uv run pytest -q                     # 63 tests, incl. fault injection
+uv run pytest -q                     # 71 tests, incl. fault injection
 uv run python -m bench.run           # writes bench/RESULTS.md
 uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys
 ```
+
+The demo config includes the optional `runtime` section (`lease_seconds`, `retry_attempts`,
+`compensation_attempts`); see [SPEC.md](SPEC.md) §4.
 
 Run the gateway (point any MCP client at it) and the policy signer in another terminal:
 

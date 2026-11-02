@@ -81,13 +81,15 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(asyncio.run(_recover(cfg)), indent=2))
     elif args.cmd == "resolve":
         store = Store(cfg.db_path)
-        rt = Runtime(store, _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {})
+        rt = Runtime(store, _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},
+                     **(cfg.runtime or {}))
         out = rt.resolve(args.plan_id, args.step, args.happened, json.loads(args.result) if args.result else None)
         print(json.dumps(out, indent=2))
         if out["status"] == "error":
             sys.exit(1)
     elif args.cmd == "abandon":
-        rt = Runtime(Store(cfg.db_path), _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {})
+        rt = Runtime(Store(cfg.db_path), _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},
+                     **(cfg.runtime or {}))
         out = rt.abandon(args.plan_id, args.reason)
         print(json.dumps(out, indent=2))
         if out["status"] == "error":
@@ -129,7 +131,7 @@ class _NoUpstreams:
 async def _recover(cfg: GatewayConfig) -> list[dict]:
     async with MCPUpstreams(cfg.servers) as up:
         rt = Runtime(Store(cfg.db_path), up, Manifest.load(cfg.manifest_path), cfg.caller or {},
-                     reader=make_reader(cfg.reader))
+                     reader=make_reader(cfg.reader), **(cfg.runtime or {}))
         return await rt.recover()
 
 

@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from mcp import Client
 
 from bench.scenarios import refund_manifest, refund_plan
@@ -29,3 +30,44 @@ async def test_agent_uses_planbound_over_plain_mcp(tmp_path):
         assert body["status"] == "completed", body
         assert "IGNORE" not in json.dumps(body)
     assert len(world.emails) == 1
+
+
+def write_config(tmp_path, **extra):
+    path = tmp_path / "planbound.config.json"
+    path.write_text(json.dumps({"servers": {}, **extra}))
+    return path
+
+
+def test_runtime_options_come_from_the_config(tmp_path):
+    cfg = GatewayConfig.load(write_config(tmp_path, runtime={
+        "lease_seconds": 300, "retry_attempts": 5, "compensation_attempts": 8}))
+    assert cfg.runtime == {"lease_ttl_s": 300.0, "retry_attempts": 5, "compensation_attempts": 8}
+    assert GatewayConfig.load(write_config(tmp_path)).runtime == {}
+
+
+@pytest.mark.parametrize("runtime, message", [
+    ({"lease_seconds": 0}, "between"),
+    ({"lease_seconds": "60"}, "must be a number"),
+    ({"retry_attempts": 2.5}, "must be an integer"),
+    ({"compensation_attempts": True}, "must be an integer"),
+    ({"lease_secs": 60}, "unknown option"),
+    ([60], "must be an object"),
+])
+def test_bad_runtime_options_are_refused(tmp_path, runtime, message):
+    with pytest.raises(ValueError, match=message):
+        GatewayConfig.load(write_config(tmp_path, runtime=runtime))
+
+
+async def test_gateway_runtime_uses_the_configured_lease(tmp_path):
+    world = make_world(latency_s=0)
+    servers = build_servers(world)
+    async with MCPUpstreams(servers) as up:
+        manifest = refund_manifest(up.catalog, auto_max=1e9)
+    (tmp_path / "planbound.effects.json").write_text(json.dumps(manifest.to_json()))
+    cfg = GatewayConfig(servers=servers, manifest_path=str(tmp_path / "planbound.effects.json"),
+                        data_dir=str(tmp_path / ".planbound"),
+                        runtime={"lease_ttl_s": 123.0, "compensation_attempts": 7})
+    gateway = Gateway(cfg)
+    async with gateway.lifespan(None):
+        rt = await gateway.get_runtime()
+        assert (rt.lease_ttl_s, rt.compensation_attempts, rt.retry_attempts) == (123.0, 7, 3)

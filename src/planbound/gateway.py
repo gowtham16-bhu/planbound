@@ -41,6 +41,37 @@ Modes: "compile" (check only), "preview" (run reads, show exact impact), "execut
 """
 
 
+# Runtime knobs a config file may set under "runtime", with their bounds.
+RUNTIME_OPTIONS = {
+    # How long a plan's lease lasts without renewal. Longer than your slowest upstream write call,
+    # shorter than you are willing to wait before `planbound recover` may take over a dead gateway.
+    "lease_seconds": ("lease_ttl_s", float, 1.0, 86400.0),
+    "retry_attempts": ("retry_attempts", int, 1, 20),
+    "compensation_attempts": ("compensation_attempts", int, 1, 50),
+}
+
+
+def parse_runtime_options(raw: Any) -> dict[str, Any]:
+    """Validate the config's "runtime" section into Runtime keyword arguments."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError('config "runtime" must be an object')  # noqa: TRY004 - one error type for bad config
+    unknown = set(raw) - set(RUNTIME_OPTIONS)
+    if unknown:
+        raise ValueError(f'config "runtime": unknown option(s) {sorted(unknown)}; '
+                         f"known: {sorted(RUNTIME_OPTIONS)}")
+    out: dict[str, Any] = {}
+    for name, value in raw.items():
+        kwarg, kind, low, high = RUNTIME_OPTIONS[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (kind is int and value != int(value)):
+            raise ValueError(f'config "runtime.{name}" must be {"an integer" if kind is int else "a number"}')
+        if not low <= value <= high:
+            raise ValueError(f'config "runtime.{name}" must be between {low:g} and {high:g}, got {value}')
+        out[kwarg] = kind(value)
+    return out
+
+
 @dataclass
 class GatewayConfig:
     servers: dict[str, Any]
@@ -48,6 +79,7 @@ class GatewayConfig:
     data_dir: str = ".planbound"
     caller: dict | None = None
     reader: dict | None = None
+    runtime: dict[str, Any] | None = None  # Runtime keyword arguments, from parse_runtime_options
 
     @classmethod
     def load(cls, path: str | Path) -> GatewayConfig:
@@ -62,6 +94,7 @@ class GatewayConfig:
             data_dir=str(base / data.get("data_dir", ".planbound")),
             caller=caller,
             reader=data.get("reader"),
+            runtime=parse_runtime_options(data.get("runtime")),
         )
 
     @property
@@ -123,6 +156,7 @@ class Gateway:
                 self.config.caller or {},
                 reader=make_reader(self.config.reader),
                 display_dir=Path(self.config.data_dir) / "display",
+                **(self.config.runtime or {}),
             )
             try:
                 yield {}

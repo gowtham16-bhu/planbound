@@ -175,9 +175,23 @@ is rejected; a second irreversible step needs `allow_partial_irreversible`.
    longer picks it up.
 8. **Leases.** One process drives a plan at a time. Commit claims the plan atomically
    (`previewed`/`awaiting_approval` → `running`), so two commits of one plan run it once. The holder
-   renews a lease (`lease_ttl_s`, default 60s) before every write and every undo step. `recover`
+   renews a lease (`runtime.lease_seconds` in the gateway config, default 60s) before every write and every undo step. `recover`
    only takes plans whose lease has expired, so it never compensates a plan a live gateway is still
    running; a gateway that finds its lease taken stops at once (`LeaseLost`).
+
+**Gateway config `runtime` section** (optional; used by `serve`, `recover`, `resolve`, `abandon`):
+
+```json
+"runtime": {"lease_seconds": 60, "retry_attempts": 3, "compensation_attempts": 5}
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `lease_seconds` | 60 (1–86400) | Lease length. Longer than your slowest upstream write; shorter than you will wait for `recover` to take over a dead gateway |
+| `retry_attempts` | 3 (1–20) | Attempts per write: definite errors for `idempotent_write`, lost answers where re-sending is safe |
+| `compensation_attempts` | 5 (1–50) | Attempts per undo step during one rollback, with exponential backoff |
+
+Unknown options and out-of-range values stop the gateway from starting.
 
 ---
 
@@ -201,7 +215,7 @@ views under the same rules. Trusted sources and `display` receipts are the only 
   require them (`strict_writes`) but cannot make a server honour what it claims to.
 - **Rollback can still be stuck.** Undo steps are retried and reconciled, but if a compensator keeps
   failing the plan stays `failed_partial` until the upstream recovers or a human steps in.
-- **Leases are not fencing.** A gateway that stalls longer than `lease_ttl_s` *between* renewing and
+- **Leases are not fencing.** A gateway that stalls longer than `lease_seconds` *between* renewing and
   sending a write can still send it after recovery took over. Recovery then sees the write as in
   flight and handles it like a crash. Closing that gap needs upstreams that check a fencing token.
 - **The manifest is trusted.** The load-time and hint checks catch obvious mislabels, not a
