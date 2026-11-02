@@ -14,12 +14,35 @@ from typing import Any, Protocol
 
 from .approval import verify_approval
 from .compiler import CompiledPlan, CompileError, compile_plan
-from .manifest import DEFAULT_CONFLICT_PATTERN, Manifest, ToolEffects, UpstreamTool, canonical, parse_io_path
-from .plan import PENDING, SKIPPED, Ctx, EvalError, Pending, Skipped, evaluate, get_path, resolve, split_path
+from .manifest import (
+    DEFAULT_CONFLICT_PATTERN,
+    Manifest,
+    ToolEffects,
+    UpstreamTool,
+    canonical,
+    parse_io_path,
+)
+from .plan import (
+    PENDING,
+    SKIPPED,
+    Ctx,
+    EvalError,
+    Pending,
+    Skipped,
+    evaluate,
+    get_path,
+    resolve,
+    split_path,
+)
 from .store import Store
 from .summary import summarize
 
 IDEM_META = "io.planbound/idempotency-key"
+# Sent with every write and undo call: {"plan": <plan_id>, "epoch": <lease epoch>}. An upstream that
+# supports fencing remembers the highest epoch it has seen per plan and refuses lower ones with an
+# error containing FENCING_REJECTED.
+FENCE_META = "io.planbound/fencing-token"
+FENCING_REJECTED = "io.planbound/fencing-token rejected"
 SKIP_MARK = {"__planbound_skipped__": True}
 
 
@@ -118,10 +141,20 @@ class Runtime:
 
     # ================================================================ public API
 
-    def compile(self, raw: Any, caller: dict | None = None) -> CompiledPlan:
+    def compile(self, raw: Any, caller: dict | None = None, *, check_age: bool = True) -> CompiledPlan:
         return compile_plan(raw, catalog=self.upstreams.catalog, manifest=self.manifest,
                             caller=caller if caller is not None else self.caller,
-                            reader_configured=self.reader is not None)
+                            reader_configured=self.reader is not None,
+                            handles=self._saved_result, now=time.time() if check_age else None)
+
+    def _saved_result(self, plan_id: str, node_id: str) -> dict | None:
+        """A result an earlier plan saved, for `checkpoint` nodes."""
+        h = self.store.get_handle(plan_id, node_id)
+        rec = self.store.get_plan(plan_id) if h else None
+        if h is None or rec is None:
+            return None
+        return {"data": h["data"], "labels": h["labels"], "trust": h["trust"], "created_at": h["created_at"],
+                "caller": rec["caller"], "plan_status": rec["status"], "skipped": h["data"] == SKIP_MARK}
 
     async def submit(self, raw: Any, mode: str = "execute", wait_seconds: float = 0) -> dict:
         try:
@@ -154,7 +187,12 @@ class Runtime:
         if rec["status"] not in ("awaiting_approval", "previewed"):
             return {"status": rec["status"], "plan_id": plan_id, "result": rec["result"]}
         preview = _preview or rec["preview"]
-        compiled = self.compile(rec["raw"], rec["caller"])
+        try:
+            compiled = self.compile(rec["raw"], rec["caller"])
+        except CompileError as e:  # e.g. a checkpoint expired, or a tool changed, while waiting for approval
+            self.store.update_plan(plan_id, status="rejected", result=e.to_json())
+            return {**e.to_json(), "plan_id": plan_id,
+                    "message": "The plan no longer compiles, so nothing was written. Fix it and submit again."}
         if preview["approval"] not in ("none", "auto"):
             if self.store.get_approval(plan_id) is None:
                 self.store.request_approval(plan_id, compiled.plan_hash, preview["preview_hash"], preview,
@@ -238,15 +276,25 @@ class Runtime:
         if entry is None or entry["status"] != "UNKNOWN":
             return {"status": "error",
                     "message": f"{step} is not an unknown write ({entry['status'] if entry else 'no such step'})"}
+        rec = self.store.get_plan(plan_id)
+        if not self.store.claim(plan_id, self.instance_id, self.lease_ttl_s, (rec["status"],)):
+            return {"status": "error", "message": "a gateway or recover is working on this plan right now; "
+                                                  "try again in a moment"}
+        try:
+            return self._resolve(plan_id, step, entry, happened, result)
+        finally:
+            self.store.update_plan(plan_id, lease_owner=None)
+
+    def _resolve(self, plan_id: str, step: str, entry: dict, happened: bool, result: Any) -> dict:
         needs_output = entry["state"] == "compensatable" and "$output" in json.dumps(entry["compensator"] or {})
         if happened and result is None and needs_output:
             return {"status": "error",
                     "message": f"{step} is undone from the tool's result; pass it (e.g. --result "
                                "'{\"refund_id\": \"RF-00042\"}') so the plan can be rolled back"}
         if happened:
-            self.store.journal_set(entry["seq"], "COMPLETED", result=result)
+            self._jset(entry["seq"], "COMPLETED", result=result)
         else:
-            self.store.journal_set(entry["seq"], "FAILED", error="a human confirmed it did not happen")
+            self._jset(entry["seq"], "FAILED", error="a human confirmed it did not happen")
         return {"status": "resolved", "plan_id": plan_id, "step": step, "happened": happened,
                 "next": "Run `planbound recover` to finish or roll back the plan."}
 
@@ -454,7 +502,8 @@ class Runtime:
         try:
             return await self._execute(run, remaining)
         except LeaseLost:
-            return {"status": "running", "plan_id": plan_id,
+            rec = self.store.get_plan(plan_id)
+            return {"status": rec["status"], "plan_id": plan_id, "lease_lost": True,
                     "message": "This gateway stalled long enough for its lease to expire, and recovery took "
                                "the plan over. It stopped without touching anything more."}
 
@@ -557,6 +606,8 @@ class Runtime:
                 value = await self._quarantine(ni, resolve(node.raw["input"], ctx))
             elif node.op == "display":
                 value = self._display(run, nid, resolve(node.raw["input"], ctx))
+            elif node.op == "checkpoint":
+                value = ni.checkpoint["data"]
             else:
                 raise EvalError(f"op {node.op!r} cannot run")
         except Skipped:
@@ -584,8 +635,7 @@ class Runtime:
             raise SimulatedCrash("gateway already crashed")
         if ni.kind != "write":
             return await self.upstreams.call(ni.tool, args)
-        if not self.store.renew(run.plan_id, self.instance_id, self.lease_ttl_s):
-            raise LeaseLost(f"{run.plan_id} was taken over by another process")
+        fence = self._fence(run.plan_id)
         key = f"{run.plan_id}:{ni.node.id}:{idx}"
         prior = self.store.journal_find(key)
         if prior is not None:
@@ -594,11 +644,13 @@ class Runtime:
             if prior["status"] != "FAILED":
                 raise UpstreamError(f"{ni.tool} is {prior['status']} in the journal; refusing to repeat it")
             seq = prior["seq"]  # it definitely did not happen: try again on the same journal entry
-            self.store.journal_set(seq, "IN_FLIGHT")
+            self._jset(seq, "IN_FLIGHT")
         else:
             seq = self.store.journal_begin(run.plan_id, ni.node.id, idx, ni.tool, eff.state, args, key,
-                                           eff.compensator)
-        meta = {IDEM_META: key} if eff.idempotency_keys else None
+                                           eff.compensator, owner=self.instance_id)
+            if seq is None:
+                raise LeaseLost(f"{run.plan_id} was taken over by another process")
+        meta = {**fence, IDEM_META: key} if eff.idempotency_keys else fence
         # Re-sending is safe when the write is idempotent by nature, or the server deduplicates on the key.
         resend_safe = eff.state == "idempotent_write" or eff.idempotency_keys
         conflict = re.compile(eff.conditional.get("conflict_pattern", DEFAULT_CONFLICT_PATTERN)) \
@@ -612,6 +664,7 @@ class Runtime:
                 ok = True
                 break
             except UpstreamError as e:
+                _raise_if_fenced(e, run.plan_id)
                 last = e
                 if e.definite and conflict and conflict.search(str(e)):
                     break  # the data changed: retrying cannot help
@@ -624,9 +677,9 @@ class Runtime:
         if not ok:
             assert last is not None
             if not last.definite:
-                self.store.journal_set(seq, "UNKNOWN", error=str(last))
+                self._jset(seq, "UNKNOWN", error=str(last))
                 raise OutcomeUnknown(f"{ni.tool} got no answer, so it may or may not have happened: {last}")
-            self.store.journal_set(seq, "FAILED", error=str(last))
+            self._jset(seq, "FAILED", error=str(last))
             if conflict and conflict.search(str(last)):
                 raise WriteConflict(f"{ni.tool} refused: the data changed after the commit re-read ({last})")
             raise UpstreamError(f"{ni.tool} failed: {last}")
@@ -634,8 +687,19 @@ class Runtime:
         if self._crashed or (self.crash_after_writes is not None and self._writes_done >= self.crash_after_writes):
             self._crashed = True  # the effect happened upstream, but the journal never hears about it
             raise SimulatedCrash(f"crash after {self._writes_done} writes")
-        self.store.journal_set(seq, "COMPLETED", result=result)
+        self._jset(seq, "COMPLETED", result=result)
         return result
+
+    def _fence(self, plan_id: str) -> dict:
+        """Renew our lease and return the fencing token to send with a write."""
+        epoch = self.store.renew(plan_id, self.instance_id, self.lease_ttl_s)
+        if epoch is None:
+            raise LeaseLost(f"{plan_id} was taken over by another process")
+        return {FENCE_META: {"plan": plan_id, "epoch": epoch}}
+
+    def _jset(self, seq: int, status: str, **kw: Any) -> None:
+        if not self.store.journal_set(seq, status, owner=self.instance_id, **kw):
+            raise LeaseLost("lost the plan's lease; the journal belongs to its new holder")
 
     async def _compensate(self, plan_id: str) -> dict:
         """Undo completed compensatable writes, newest first. Each undo is retried; failures are recorded
@@ -644,8 +708,7 @@ class Runtime:
         entries = [e for e in self.store.journal(plan_id)
                    if e["state"] == "compensatable" and e["status"] in ("COMPLETED", "COMPENSATION_FAILED")]
         for e in reversed(entries):
-            if not self.store.renew(plan_id, self.instance_id, self.lease_ttl_s):
-                raise LeaseLost(f"{plan_id} was taken over by another process")
+            fence = self._fence(plan_id)
             error: str | None = None
             for attempt in range(self.compensation_attempts):
                 try:
@@ -654,20 +717,25 @@ class Runtime:
                     error = f"cannot build the undo call: {ex}"
                     break
                 try:
-                    await self.upstreams.call(tool, args, {IDEM_META: e["idem_key"] + ":compensate"})
+                    await self.upstreams.call(tool, args, {**fence, IDEM_META: e["idem_key"] + ":compensate"})
                     error = None
                     break
                 except (SimulatedCrash, LeaseLost):
                     raise
+                except UpstreamError as ex:
+                    _raise_if_fenced(ex, plan_id)
+                    error = str(ex)
+                    if attempt + 1 < self.compensation_attempts:
+                        await asyncio.sleep(self.retry_delay_s * 2 ** attempt)
                 except Exception as ex:  # noqa: BLE001 - every failure must be recorded, never raised mid-rollback
                     error = str(ex)
                     if attempt + 1 < self.compensation_attempts:
                         await asyncio.sleep(self.retry_delay_s * 2 ** attempt)
             if error is None:
-                self.store.journal_set(e["seq"], "COMPENSATED")
+                self._jset(e["seq"], "COMPENSATED")
                 done.append(_step(e))
             else:
-                self.store.journal_set(e["seq"], "COMPENSATION_FAILED", error=error)
+                self._jset(e["seq"], "COMPENSATION_FAILED", error=error)
                 failed.append({"step": _step(e), "error": error})
         return {"ok": not failed, "compensated": len(done), "failed": failed}
 
@@ -675,21 +743,24 @@ class Runtime:
 
     async def _recover_one(self, plan_id: str) -> dict:
         rec = self.store.get_plan(plan_id)
-        compiled = self.compile(rec["raw"], rec["caller"])
+        compiled = self.compile(rec["raw"], rec["caller"], check_age=False)  # it already started: finish it
         for e in self.store.journal(plan_id):
             if e["status"] != "IN_FLIGHT":
                 continue
             # A crash during the call: re-send to learn the outcome, but only where that cannot repeat it.
             eff = compiled.info[e["node_id"]].effects
             if e["state"] == "idempotent_write" or eff.idempotency_keys:
+                fence = self._fence(plan_id)
                 try:
                     result = await self.upstreams.call(e["tool"], e["args"],
-                                                       {IDEM_META: e["idem_key"]} if eff.idempotency_keys else None)
-                    self.store.journal_set(e["seq"], "COMPLETED", result=result)
+                                                       {**fence, IDEM_META: e["idem_key"]} if eff.idempotency_keys
+                                                       else fence)
+                    self._jset(e["seq"], "COMPLETED", result=result)
                 except UpstreamError as ex:
-                    self.store.journal_set(e["seq"], "FAILED" if ex.definite else "UNKNOWN", error=str(ex))
+                    _raise_if_fenced(ex, plan_id)
+                    self._jset(e["seq"], "FAILED" if ex.definite else "UNKNOWN", error=str(ex))
             else:
-                self.store.journal_set(e["seq"], "UNKNOWN", error="crashed during the call; outcome unknown")
+                self._jset(e["seq"], "UNKNOWN", error="crashed during the call; outcome unknown")
         result = await self._settle(plan_id)
         if result["status"] == "failed_partial" and "compensation" not in result:
             # Past the point of no return with nothing unknown: roll forward.
@@ -794,6 +865,11 @@ def _waves_of(nodes: list[str], deps: dict[str, set[str]], done: set[str]) -> li
         finished |= set(wave)
         remaining = [n for n in remaining if n not in finished]
     return waves
+
+
+def _raise_if_fenced(error: Exception, plan_id: str) -> None:
+    if FENCING_REJECTED in str(error):
+        raise LeaseLost(f"an upstream refused our fencing token: {plan_id} has a newer holder") from error
 
 
 def _step(entry: dict) -> str:

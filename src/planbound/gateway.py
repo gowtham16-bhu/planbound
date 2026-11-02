@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -30,6 +32,9 @@ Nodes (each has a unique "id", lowercase):
   {"id","op":"quarantine_read","input":{"$ref":...},"field":"text_field","max_items":N,
    "schema":{"name":{"enum":[...]} | {"type":"boolean"|"integer"|"number"}}}
   {"id","op":"display","input":{"$ref":...}}   shows data to the human only, never to you
+  {"id","op":"checkpoint","handle":"h://plan/node","max_age_seconds"?:N}
+      continue from a result an earlier plan of yours returned: use it like a read, without reading again.
+      Investigate in stages: run a read-only plan, look at the summaries, then send the next plan.
 Values: literals, {"$ref":"node.a.b"}, {"$item":"field"} (inside map args / where),
   {"$agg":{"fn":"count|distinct_count|sum|min|max|mean","of":"node.path","field":"f"}},
   {"$caller":"attr"} (the signed-in user; required where a tool acts on "your own" record).
@@ -48,7 +53,10 @@ RUNTIME_OPTIONS = {
     "lease_seconds": ("lease_ttl_s", float, 1.0, 86400.0),
     "retry_attempts": ("retry_attempts", int, 1, 20),
     "compensation_attempts": ("compensation_attempts", int, 1, 50),
+    # Gateway-level: reconcile unfinished plans in the background every N seconds (0 = off).
+    "reconcile_seconds": (None, float, 0.0, 86400.0),
 }
+log = logging.getLogger("planbound")
 
 
 def parse_runtime_options(raw: Any) -> dict[str, Any]:
@@ -68,7 +76,8 @@ def parse_runtime_options(raw: Any) -> dict[str, Any]:
             raise ValueError(f'config "runtime.{name}" must be {"an integer" if kind is int else "a number"}')
         if not low <= value <= high:
             raise ValueError(f'config "runtime.{name}" must be between {low:g} and {high:g}, got {value}')
-        out[kwarg] = kind(value)
+        if kwarg is not None:
+            out[kwarg] = kind(value)
     return out
 
 
@@ -80,6 +89,7 @@ class GatewayConfig:
     caller: dict | None = None
     reader: dict | None = None
     runtime: dict[str, Any] | None = None  # Runtime keyword arguments, from parse_runtime_options
+    reconcile_seconds: float = 0.0
 
     @classmethod
     def load(cls, path: str | Path) -> GatewayConfig:
@@ -95,6 +105,7 @@ class GatewayConfig:
             caller=caller,
             reader=data.get("reader"),
             runtime=parse_runtime_options(data.get("runtime")),
+            reconcile_seconds=float((data.get("runtime") or {}).get("reconcile_seconds", 0)),
         )
 
     @property
@@ -149,19 +160,39 @@ class Gateway:
     async def lifespan(self, _server: MCPServer):
         """Upstream connections live as long as the gateway, in one task."""
         async with MCPUpstreams(self.config.servers) as upstreams:
-            self.runtime = Runtime(
-                Store(self.config.db_path),
-                upstreams,
-                Manifest.load(self.config.manifest_path),
-                self.config.caller or {},
-                reader=make_reader(self.config.reader),
-                display_dir=Path(self.config.data_dir) / "display",
-                **(self.config.runtime or {}),
-            )
+            self.runtime = self._make_runtime(upstreams)
+            reconciler = None
+            if self.config.reconcile_seconds > 0:
+                # Its own Runtime, so its own lease identity: it can only take over plans whose lease has
+                # expired, never one this gateway is still running.
+                reconciler = asyncio.create_task(self._reconcile(self._make_runtime(upstreams)))
             try:
                 yield {}
             finally:
+                if reconciler:
+                    reconciler.cancel()
                 self.runtime = None
+
+    def _make_runtime(self, upstreams) -> Runtime:
+        return Runtime(
+            Store(self.config.db_path),
+            upstreams,
+            Manifest.load(self.config.manifest_path),
+            self.config.caller or {},
+            reader=make_reader(self.config.reader),
+            display_dir=Path(self.config.data_dir) / "display",
+            **(self.config.runtime or {}),
+        )
+
+    async def _reconcile(self, runtime: Runtime) -> None:
+        while True:
+            await asyncio.sleep(self.config.reconcile_seconds)
+            try:
+                for report in await runtime.recover():
+                    if report["status"] != "skipped":
+                        log.info("reconciled %s: %s", report["plan_id"], report["status"])
+            except Exception:
+                log.exception("background reconciliation failed")
 
     async def get_runtime(self) -> Runtime:
         if self.runtime is None:

@@ -36,8 +36,10 @@ def main(argv: list[str] | None = None) -> None:
         a.add_argument("--keys", default=".planbound/keys")
         a.add_argument("--yes", action="store_true")
     sub.add_parser("pending", help="list approval requests waiting for the signer or a human")
-    sub.add_parser("recover", help="reconcile plans that did not end cleanly: retry failed undo steps, "
-                                   "compensate or finish crashed plans")
+    rc = sub.add_parser("recover", help="reconcile plans that did not end cleanly: retry failed undo steps, "
+                                        "compensate or finish crashed plans")
+    rc.add_argument("--watch", action="store_true", help="keep reconciling until stopped")
+    rc.add_argument("--interval", type=float, default=30.0, help="seconds between passes with --watch")
     r = sub.add_parser("resolve", help="record what happened to a write whose outcome was unknown")
     r.add_argument("plan_id")
     r.add_argument("step", help="the step as reported, e.g. refunds[3]")
@@ -78,7 +80,18 @@ def main(argv: list[str] | None = None) -> None:
         for req in store.approvals_with_status("pending", "escalated"):
             print(describe_request(req), end="\n\n")
     elif args.cmd == "recover":
-        print(json.dumps(asyncio.run(_recover(cfg)), indent=2))
+        if not args.watch:
+            print(json.dumps(asyncio.run(_recover(cfg)), indent=2))
+            return
+        print(f"Reconciling every {args.interval:g}s; Ctrl-C to stop.", file=sys.stderr)
+        try:
+            while True:
+                for report in asyncio.run(_recover(cfg)):
+                    if report["status"] != "skipped":
+                        print(json.dumps(report), flush=True)
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            return
     elif args.cmd == "resolve":
         store = Store(cfg.db_path)
         rt = Runtime(store, _NoUpstreams(), Manifest.load(cfg.manifest_path), cfg.caller or {},

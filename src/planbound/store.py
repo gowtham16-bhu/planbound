@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS plans (
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
     lease_owner  TEXT,
-    lease_until  REAL
+    lease_until  REAL,
+    lease_epoch  INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS handles (
     plan_id     TEXT NOT NULL,
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS handles (
     labels_json TEXT NOT NULL,
     trust       TEXT NOT NULL,
     data_json   TEXT NOT NULL,
+    created_at  REAL,
     PRIMARY KEY (plan_id, node_id)
 );
 CREATE TABLE IF NOT EXISTS journal (
@@ -83,9 +85,12 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.executescript(SCHEMA)
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(plans)")}
-        for col, kind in (("lease_owner", "TEXT"), ("lease_until", "REAL")):
+        for col, kind in (("lease_owner", "TEXT"), ("lease_until", "REAL"),
+                          ("lease_epoch", "INTEGER NOT NULL DEFAULT 0")):
             if col not in cols:  # databases created before leases existed
                 self.db.execute(f"ALTER TABLE plans ADD COLUMN {col} {kind}")
+        if "created_at" not in {r[1] for r in self.db.execute("PRAGMA table_info(handles)")}:
+            self.db.execute("ALTER TABLE handles ADD COLUMN created_at REAL")
 
     def close(self) -> None:
         self.db.close()
@@ -95,9 +100,9 @@ class Store:
     def create_plan(self, plan_id: str, plan_hash: str, raw: dict, caller: dict) -> None:
         now = time.time()
         self.db.execute(
-            "INSERT INTO plans VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO plans VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (plan_id, plan_hash, json.dumps(raw), json.dumps(caller), "compiled", None, None, None, now, now,
-             None, None),
+             None, None, 0),
         )
 
     def update_plan(self, plan_id: str, **fields: Any) -> None:
@@ -133,11 +138,15 @@ class Store:
 
     def claim(self, plan_id: str, owner: str, ttl_s: float, statuses: tuple[str, ...], *,
               new_status: str | None = None) -> bool:
-        """Atomically take the plan if it is in one of `statuses` and nobody else holds a live lease."""
+        """Atomically take the plan if it is in one of `statuses` and nobody else holds a live lease.
+
+        A new holder bumps the lease epoch: the fencing token every later write carries, so upstreams
+        (and this journal) can refuse a former holder that wakes up late."""
         now = time.time()
         q = ",".join("?" for _ in statuses)
-        sets = "lease_owner = ?, lease_until = ?, updated_at = ?" + (", status = ?" if new_status else "")
-        vals: list[Any] = [owner, now + ttl_s, now] + ([new_status] if new_status else [])
+        sets = ("lease_epoch = lease_epoch + (CASE WHEN lease_owner = ? THEN 0 ELSE 1 END), "
+                "lease_owner = ?, lease_until = ?, updated_at = ?" + (", status = ?" if new_status else ""))
+        vals: list[Any] = [owner, owner, now + ttl_s, now] + ([new_status] if new_status else [])
         cur = self.db.execute(
             f"UPDATE plans SET {sets} WHERE plan_id = ? AND status IN ({q})"
             " AND (lease_owner IS NULL OR lease_until < ? OR lease_owner = ?)",
@@ -145,11 +154,13 @@ class Store:
         )
         return cur.rowcount == 1
 
-    def renew(self, plan_id: str, owner: str, ttl_s: float) -> bool:
-        """Extend our lease. False means someone else took the plan over: stop touching it."""
+    def renew(self, plan_id: str, owner: str, ttl_s: float) -> int | None:
+        """Extend our lease and return its epoch. None means someone else took the plan over: stop."""
         cur = self.db.execute("UPDATE plans SET lease_until = ? WHERE plan_id = ? AND lease_owner = ?",
                               (time.time() + ttl_s, plan_id, owner))
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return None
+        return int(self.db.execute("SELECT lease_epoch FROM plans WHERE plan_id = ?", (plan_id,)).fetchone()[0])
 
     def plans_with_status(self, *statuses: str) -> list[str]:
         q = ",".join("?" for _ in statuses)
@@ -159,8 +170,8 @@ class Store:
 
     def put_handle(self, plan_id: str, node_id: str, data: Any, *, tool: str | None, labels: set[str], trust: str) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO handles VALUES (?,?,?,?,?,?)",
-            (plan_id, node_id, tool, json.dumps(sorted(labels)), trust, json.dumps(data)),
+            "INSERT OR REPLACE INTO handles VALUES (?,?,?,?,?,?,?)",
+            (plan_id, node_id, tool, json.dumps(sorted(labels)), trust, json.dumps(data), time.time()),
         )
 
     def get_handle(self, plan_id: str, node_id: str) -> dict | None:
@@ -174,6 +185,7 @@ class Store:
             "labels": json.loads(row["labels_json"]),
             "trust": row["trust"],
             "data": json.loads(row["data_json"]),
+            "created_at": row["created_at"] or 0.0,
         }
 
     def handles_for(self, plan_id: str) -> dict[str, Any]:
@@ -182,22 +194,28 @@ class Store:
 
     # ---------------------------------------------------------------- journal
 
+    # With `owner`, a journal write only lands while that owner holds the plan's lease: a process that
+    # lost the plan can never overwrite what the new holder recorded.
+    _HOLDS = "(? IS NULL OR EXISTS (SELECT 1 FROM plans p WHERE p.plan_id = {plan} AND p.lease_owner = ?))"
+
     def journal_begin(self, plan_id: str, node_id: str, item: int, tool: str, state: str, args: dict,
-                      idem_key: str, compensator: dict | None) -> int:
+                      idem_key: str, compensator: dict | None, *, owner: str | None = None) -> int | None:
         cur = self.db.execute(
             "INSERT INTO journal (plan_id, node_id, item_index, tool, state, args_json, idem_key, status,"
-            " compensator_json, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " compensator_json, updated_at) SELECT ?,?,?,?,?,?,?,?,?,? WHERE " + self._HOLDS.format(plan="?"),
             (plan_id, node_id, item, tool, state, json.dumps(args), idem_key, "IN_FLIGHT",
-             json.dumps(compensator) if compensator else None, time.time()),
+             json.dumps(compensator) if compensator else None, time.time(), owner, plan_id, owner),
         )
-        return int(cur.lastrowid)
+        return int(cur.lastrowid) if cur.rowcount == 1 else None
 
-    def journal_set(self, seq: int, status: str, *, result: Any = None, error: str | None = None) -> None:
-        self.db.execute(
+    def journal_set(self, seq: int, status: str, *, result: Any = None, error: str | None = None,
+                    owner: str | None = None) -> bool:
+        cur = self.db.execute(
             "UPDATE journal SET status = ?, result_json = COALESCE(?, result_json), error = ?, updated_at = ?"
-            " WHERE seq = ?",
-            (status, json.dumps(result) if result is not None else None, error, time.time(), seq),
+            " WHERE seq = ? AND " + self._HOLDS.format(plan="journal.plan_id"),
+            (status, json.dumps(result) if result is not None else None, error, time.time(), seq, owner, owner),
         )
+        return cur.rowcount == 1
 
     def journal_find(self, idem_key: str) -> dict | None:
         """The journal entry for one write (plan:node:item), if it was ever attempted."""

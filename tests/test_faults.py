@@ -43,6 +43,12 @@ class Faulty:
             raise SimulatedCrash(f"gateway died while calling {tool}")
         self.rules.append([tool, times, act])
 
+    def before_async(self, tool, fn, times=1):
+        async def act(tool, args, meta):
+            await fn(args)
+            return await self.inner.call(tool, args, meta)
+        self.rules.append([tool, times, act])
+
     def before(self, tool, fn, times=1):
         """Something else changes the world just before this call reaches the server."""
         async def act(tool, args, meta):
@@ -221,6 +227,10 @@ async def test_strict_writes_refuses_money_moving_tools_without_guarantees(env):
     [d] = e.value.diagnostics
     assert d.code == "E_UNSAFE_WRITE" and "conditional" in d.message
     m.tools["billing.refund_order"].conditional = {"arg": "expected_version"}
+    with pytest.raises(CompileError) as e:
+        compile_plan(conditional_plan(), catalog=env.up.catalog, manifest=m, caller={})
+    assert "fencing tokens" in e.value.diagnostics[0].message
+    m.tools["billing.refund_order"].fencing = True
     compile_plan(conditional_plan(), catalog=env.up.catalog, manifest=m, caller={})
     m.tools["billing.refund_order"].idempotency_keys = False
     with pytest.raises(CompileError) as e:
@@ -334,7 +344,7 @@ async def test_a_gateway_that_lost_its_lease_stops_writing(env):
 
     up.before("billing.refund_order", takeover)
     res = await stalled.submit(plan)
-    assert res["status"] == "running" and "took the plan over" in res["message"], res
+    assert res["lease_lost"] and "took the plan over" in res["message"], res
     assert len(env.world.refunds) == 1  # it stopped after the write in progress
     reports = await rescuer.recover()
     assert reports[0]["status"] == "recovered_compensated", reports
@@ -372,3 +382,49 @@ async def test_abandon_closes_a_plan_recovery_cannot_finish(env):
 async def test_only_unfinished_plans_can_be_abandoned(env):
     res = await env.runtime(manifest(env)).submit(refund_plan())
     assert env.runtime(manifest(env)).abandon(res["plan_id"], "oops")["status"] == "error"
+
+
+# ---------------------------------------------------------------- fencing: a late writer is refused
+
+
+async def test_fencing_token_refuses_a_stalled_gateways_late_write(env):
+    """The gap a lease alone leaves: the gateway renews, stalls, recovery takes over and rolls back, and
+    only then does the stalled write reach the server. The fencing token makes the server refuse it."""
+    up = Faulty(env.up)
+    plan = refund_plan()
+    plan["nodes"][4]["concurrency"] = 1
+    stalled = env.runtime(manifest(env, fencing=True), upstreams=up, lease_ttl_s=60)
+    rescuer = env.runtime(manifest(env, fencing=True))
+    reports = []
+
+    async def stall_then_rescue(args):
+        env.store.db.execute("UPDATE plans SET lease_until = ?", (time.time() - 1,))
+        reports.extend(await rescuer.recover())  # recovery re-sends this refund, then undoes it
+
+    up.before_async("billing.refund_order", stall_then_rescue)
+    res = await stalled.submit(plan)
+    assert [r["status"] for r in reports] == ["recovered_compensated"], reports
+    assert env.world.fenced_out == 1  # the late write was refused by billing
+    assert res["lease_lost"] and res["status"] == "recovered_compensated", res
+    assert env.world.refunded() == []
+    assert len(env.world.refunds) == 1  # only recovery's re-send ever took effect, and it was undone
+    assert journal_status(env, res["plan_id"]) == {"refunds[0]": "COMPENSATED"}
+
+
+async def test_journal_refuses_writes_from_a_process_without_the_lease(env):
+    rt = env.runtime(manifest(env))
+    pv = await rt.submit(refund_plan(), mode="preview")
+    plan_id = pv["plan_id"]
+    assert env.store.claim(plan_id, "someone", 60, ("previewed",))
+    assert env.store.journal_begin(plan_id, "refunds", 0, "billing.refund_order", "compensatable", {}, "k",
+                                   None, owner="intruder") is None
+    seq = env.store.journal_begin(plan_id, "refunds", 0, "billing.refund_order", "compensatable", {}, "k",
+                                  None, owner="someone")
+    assert seq is not None
+    assert not env.store.journal_set(seq, "COMPLETED", owner="intruder")
+    assert env.store.journal_set(seq, "COMPLETED", owner="someone")
+    first = env.store.renew(plan_id, "someone", 60)
+    env.store.db.execute("UPDATE plans SET lease_until = ?", (time.time() - 1,))
+    assert env.store.claim(plan_id, "next", 60, ("previewed",))
+    assert env.store.renew(plan_id, "next", 60) == first + 1  # a new holder means a new epoch
+    assert env.store.renew(plan_id, "someone", 60) is None

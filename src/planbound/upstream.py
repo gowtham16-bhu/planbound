@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import AsyncExitStack
-from typing import Any
+from typing import Any, Self
 
 from mcp import Client, StdioServerParameters
 
@@ -23,7 +23,7 @@ class MCPUpstreams:
         self._clients: dict[str, Client] = {}
         self._stack = AsyncExitStack()
 
-    async def __aenter__(self) -> MCPUpstreams:
+    async def __aenter__(self) -> Self:
         for name, target in self.servers.items():
             if isinstance(target, dict):
                 target = StdioServerParameters(command=target["command"], args=target.get("args", []),

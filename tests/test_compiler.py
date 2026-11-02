@@ -110,14 +110,16 @@ async def test_when_cannot_depend_on_a_write(env):
     assert found == ["E_WHEN_ON_WRITE"]
 
 
-async def test_cycle_and_reserved_ops(env):
+async def test_cycle_and_checkpoint_shape(env):
     plan = {"planbound": "0.1", "nodes": [
         {"id": "a", "op": "filter", "input": {"$ref": "b"}, "where": {"eq": [1, 1]}},
         {"id": "b", "op": "filter", "input": {"$ref": "a"}, "where": {"eq": [1, 1]}},
     ]}
     assert codes(env, plan)[0] == ["E_CYCLE"]
     plan = {"planbound": "0.1", "nodes": [{"id": "c", "op": "checkpoint"}]}
-    assert codes(env, plan)[0] == ["E_UNSUPPORTED_OP"]
+    assert codes(env, plan)[0] == ["E_PLAN_SHAPE"]
+    plan["nodes"][0]["handle"] = "h://p_00000/nowhere"
+    assert codes(env, plan)[0] == ["E_UNKNOWN_HANDLE"]
 
 
 async def test_quarantine_needs_reader_and_closed_schema(env):
@@ -135,7 +137,7 @@ async def test_identity_binding(env):
     m = hr_manifest(env.up.catalog)
     me = {"employee_id": "E-1001", "roles": ["employee"]}
     compile_plan(address_plan({"$caller": "employee_id"}), catalog=env.up.catalog, manifest=m, caller=me)
-    found, err = codes(env, address_plan("E-2002"), manifest=m, caller=me)
+    found, _ = codes(env, address_plan("E-2002"), manifest=m, caller=me)
     assert set(found) == {"E_IDENTITY"} and len(found) == 3
     admin = {"employee_id": "E-9000", "roles": ["hr_admin"]}
     compile_plan(address_plan("E-2002"), catalog=env.up.catalog, manifest=m, caller=admin)

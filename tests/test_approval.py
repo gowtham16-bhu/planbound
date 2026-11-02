@@ -2,7 +2,12 @@ import asyncio
 import time
 
 from bench.scenarios import refund_manifest, refund_plan
-from planbound.approval import BudgetPolicy, PolicySigner, generate_keys, verify_approval
+from planbound.approval import (
+    BudgetPolicy,
+    PolicySigner,
+    generate_keys,
+    verify_approval,
+)
 
 
 def setup(env, budget=1e9, max_plan_cost=None):
@@ -62,7 +67,7 @@ async def test_split_plans_hit_the_cumulative_budget(env):
     for o in env.world.orders.values():  # new overdue orders arrive
         if o.status == "paid":
             o.status = "overdue"
-    second = await rt.submit(refund_plan(), wait_seconds=0)
+    await rt.submit(refund_plan(), wait_seconds=0)
     [d2] = signer.process()
     assert d2["decision"] == "escalated"
 

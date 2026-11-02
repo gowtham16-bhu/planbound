@@ -20,7 +20,10 @@ from pathlib import Path
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+)
 
 from .manifest import canonical
 from .store import Store
@@ -149,9 +152,7 @@ class PolicySigner:
                 continue
             if status in ("completed", "failed_partial", "needs_attention", "abandoned"):
                 self._set_hold(plan_id, "finalized")
-            elif status in ("failed_compensated", "recovered_compensated", "stale", "rejected", "missing"):
-                self._set_hold(plan_id, "released")
-            elif status in ("awaiting_approval", "previewed") and approval and approval["expires_at"] < time.time():
+            elif status in ("failed_compensated", "recovered_compensated", "stale", "rejected", "missing") or status in ("awaiting_approval", "previewed") and approval and approval["expires_at"] < time.time():
                 self._set_hold(plan_id, "released")
 
     def _set_hold(self, plan_id: str, status: str) -> None:

@@ -92,7 +92,7 @@ async def timed_calls(up, m: Metrics, calls: list[tuple[str, dict]]) -> list:
     async def one(name, args):
         try:
             return await up.call(name, args)
-        except Exception as e:  # the model sees the error as a tool result
+        except Exception as e:  # noqa: BLE001 - the model sees any error as a tool result
             return {"error": str(e)}
 
     results = await asyncio.gather(*(one(n, a) for n, a in calls))
@@ -182,10 +182,11 @@ async def code_mode(world, up) -> Metrics:
     env.update({s: _Server(up, m, s) for s in {n.split(".")[0] for n in up.catalog}})
     start = time.perf_counter()
     try:
-        exec(compile("async def __main():\n" + "\n".join("    " + l for l in CODE.strip().splitlines()),
-                     "<script>", "exec"), env)
+        # This IS code mode: run the script the simulated model wrote.
+        source = "async def __main():\n" + "\n".join("    " + line for line in CODE.strip().splitlines())
+        exec(compile(source, "<script>", "exec"), env)  # noqa: S102
         await env["__main"]()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - a script failure is a measured outcome
         out.append(f"Traceback: {e}")
         m.notes.append("the script raised mid-batch; refunds that already ran stay done")
     m.tool_time_s = min(m.tool_time_s, time.perf_counter() - start)  # concurrent calls overlap
@@ -220,10 +221,10 @@ async def planbound(world, up, tmp: Path) -> Metrics:
 # ---------------------------------------------------------------- runner
 
 WORKLOADS = {
-    "refund_40_orders": dict(n_orders=40, n_overdue=8),
-    "refund_400_orders": dict(n_orders=400, n_overdue=40, n_disputed=3),
-    "refund_failure_mid_batch": dict(n_orders=40, n_overdue=8, fail_one=True),
-    "injected_order_note": dict(n_orders=40, n_overdue=8, inject_note=True),
+    "refund_40_orders": {"n_orders": 40, "n_overdue": 8},
+    "refund_400_orders": {"n_orders": 400, "n_overdue": 40, "n_disputed": 3},
+    "refund_failure_mid_batch": {"n_orders": 40, "n_overdue": 8, "fail_one": True},
+    "injected_order_note": {"n_orders": 40, "n_overdue": 8, "inject_note": True},
 }
 
 
@@ -234,7 +235,7 @@ async def run_one(strategy: str, spec: dict, tmp: Path) -> Metrics:
     if fail_one:
         overdue = [o for o in world.orders.values() if o.status == "overdue" and o.amount < 5000
                    and o.order_id not in world.disputed]
-        world.fail_refund_on = {sorted(o.order_id for o in overdue)[-1]}
+        world.fail_refund_on = {max(o.order_id for o in overdue)}
     async with MCPUpstreams(build_servers(world)) as up:
         if strategy == "direct":
             m = await direct(world, up)
@@ -260,12 +261,12 @@ async def main() -> None:
     for name, spec in WORKLOADS.items():
         results[name] = [await run_one(s, spec, tmp) for s in ("direct", "code", "planbound")]
     lines = ["# Planbound benchmark (simulated model, real MCP calls)", "",
-             f"Latency model: {TTFT_S}s per turn + input/{PREFILL_TPS} tok/s + output/{DECODE_TPS} tok/s "
-             "+ measured tool time. Tokens ≈ characters / 4.", ""]
+             (f"Latency model: {TTFT_S}s per turn + input/{PREFILL_TPS} tok/s + output/{DECODE_TPS} tok/s "
+              "+ measured tool time. Tokens ≈ characters / 4."), ""]
     for name, rows in results.items():
         lines += [f"## {name}", "",
-                  "| Strategy | LLM turns | Input tokens | Output tokens | Tool calls | Untrusted text in context "
-                  "| Modeled latency | End state |",
+                  ("| Strategy | LLM turns | Input tokens | Output tokens | Tool calls | Untrusted text in context "
+                   "| Modeled latency | End state |"),
                   "|---|---|---|---|---|---|---|---|"]
         for r in rows:
             exposure = f"{r.untrusted_tokens_in_context} tok" + (" (incl. injection)" if r.injection_in_context else "")

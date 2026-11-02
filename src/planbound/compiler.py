@@ -6,10 +6,12 @@ All diagnostics are returned together so the model can fix a plan in one retry.
 from __future__ import annotations
 
 import hashlib
+import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from .manifest import WRITE_STATES, Manifest, ToolEffects, UpstreamTool, canonical
+from .manifest import Manifest, ToolEffects, UpstreamTool, canonical
 from .plan import (
     AGG_FNS,
     ID_RE,
@@ -29,6 +31,10 @@ from .plan import (
 
 SUPPORTED_VERSION = "0.1"
 QUARANTINE_TYPES = ("boolean", "integer", "number")
+HANDLE_RE = re.compile(r"^h://(p_[0-9a-f]+)/([a-z][a-z0-9_]{0,31})$")
+# Plans whose saved results may seed a later plan: completed ones, and ones that never wrote anything
+# (every handle they hold is a real read).
+CHECKPOINT_SOURCE_STATUSES = ("completed", "previewed", "awaiting_approval", "stale", "rejected")
 
 
 @dataclass
@@ -64,6 +70,7 @@ class NodeInfo:
     effects: ToolEffects | None = None
     labels: set[str] = field(default_factory=set)
     trust: str = "untrusted"
+    checkpoint: dict | None = None  # for op "checkpoint": the saved result it loads
 
 
 @dataclass
@@ -201,7 +208,11 @@ def compile_plan(
     manifest: Manifest,
     caller: dict,
     reader_configured: bool = False,
+    handles: Callable[[str, str], dict | None] | None = None,
+    now: float | None = None,
 ) -> CompiledPlan:
+    """`handles(plan_id, node_id)` loads a saved result for `checkpoint` nodes. `now` enables their
+    `max_age_seconds` check (left out when recovering a plan that already started)."""
     diags: list[Diagnostic] = []
 
     def err(code: str, node: Node | None, suffix: str, message: str, hint: str | None = None) -> None:
@@ -230,16 +241,17 @@ def compile_plan(
             err("E_UNKNOWN_OP", node, ".op", f"Unknown op {node.op!r}.", f"Use one of: {', '.join(OPS[:6])}.")
             continue
         if node.op == "checkpoint":
-            err("E_UNSUPPORTED_OP", node, ".op", "Op 'checkpoint' is reserved for Planbound v0.2.",
-                "Split the task: submit this plan, read the summary, then submit the next plan.")
+            ni = NodeInfo(node=node, kind="read")
+            info[nid] = ni
+            _check_checkpoint(node, ni, handles, caller, now, err)
             continue
         if node.op == "quarantine_read" and not reader_configured:
             err("E_QUARANTINE_READER_UNCONFIGURED", node, ".op",
                 "This gateway has no quarantined reader model configured.",
                 "Start the gateway with a reader (see README), or avoid reading free text.")
-        if node.op in ("map", "filter", "partition", "quarantine_read", "display"):
-            if is_special(r.get("input")) != "$ref":
-                err("E_PLAN_SHAPE", node, ".input", f"'{node.op}' needs \"input\": {{\"$ref\": \"<node>\"}}.")
+        if (node.op in ("map", "filter", "partition", "quarantine_read", "display")
+                and is_special(r.get("input")) != "$ref"):
+            err("E_PLAN_SHAPE", node, ".input", f"'{node.op}' needs \"input\": {{\"$ref\": \"<node>\"}}.")
         if node.op in ("filter", "partition") and not isinstance(r.get("where"), dict):
             err("E_PLAN_SHAPE", node, ".where", f"'{node.op}' needs a 'where' condition.")
         if node.op in ("map", "quarantine_read"):
@@ -322,12 +334,14 @@ def compile_plan(
                 missing.append("idempotency keys")
             if eff.conditional is None:
                 missing.append("a conditional write")
+            if not eff.fencing:
+                missing.append("fencing tokens")
             if missing:
                 err("E_UNSAFE_WRITE", node, args_suffix.replace(".args", ".tool"),
                     f"Strict writes: {tool_name!r} moves money or needs approval, but the manifest does not "
                     f"declare {' or '.join(missing)} for it.",
-                    "The operator must confirm the upstream supports them (idempotency_keys, conditional) "
-                    "or turn off defaults.strict_writes.")
+                    "The operator must confirm the upstream supports them (idempotency_keys, conditional, "
+                    "fencing) or turn off defaults.strict_writes.")
 
     if diags:
         raise CompileError(diags)
@@ -385,6 +399,8 @@ def compile_plan(
                 root = ref_root(kind, v)
                 if root:
                     incoming |= info[root].labels
+        if ni.checkpoint is not None:
+            continue  # labels and trust come with the saved result
         if ni.effects:
             ok = True
             if ni.effects.allowed_input_labels is not None:
@@ -532,8 +548,77 @@ def _check_specials(node: Node, caller: dict, err) -> None:
                     err("E_BAD_AGG", node, f".{key}", f"$agg needs 'fn' in {AGG_FNS} and 'of': \"<node>\".")
 
 
+def _check_checkpoint(node: Node, ni: NodeInfo, handles, caller: dict, now: float | None, err) -> None:
+    r = node.raw
+    handle = r.get("handle")
+    m = HANDLE_RE.match(handle) if isinstance(handle, str) else None
+    if not m:
+        err("E_PLAN_SHAPE", node, ".handle", "'checkpoint' needs \"handle\": \"h://<plan_id>/<node_id>\".",
+            "Use a handle returned in an earlier plan's summaries.")
+        return
+    age_limit = r.get("max_age_seconds")
+    if age_limit is not None and (isinstance(age_limit, bool) or not isinstance(age_limit, (int, float))
+                                  or age_limit <= 0):
+        err("E_PLAN_SHAPE", node, ".max_age_seconds", "'max_age_seconds' must be a positive number.")
+        return
+    saved = handles(m.group(1), m.group(2)) if handles else None
+    if saved is None:
+        err("E_UNKNOWN_HANDLE", node, ".handle", f"No saved result {handle!r}.",
+            "Use a handle exactly as an earlier plan's summary returned it.")
+        return
+    if saved["caller"] != caller:
+        err("E_HANDLE_CALLER", node, ".handle", f"{handle!r} belongs to another caller's plan.",
+            "A plan may only continue from its own caller's results.")
+        return
+    if saved["plan_status"] not in CHECKPOINT_SOURCE_STATUSES:
+        err("E_HANDLE_UNUSABLE", node, ".handle",
+            f"{handle!r} comes from a plan that ended {saved['plan_status']}; its results may describe writes "
+            "that were undone or never finished.", "Re-read the data in this plan instead.")
+        return
+    if saved["skipped"]:
+        err("E_UNKNOWN_HANDLE", node, ".handle", f"{handle!r} was skipped, so it holds no data.")
+        return
+    if now is not None and age_limit is not None and now - saved["created_at"] > age_limit:
+        err("E_HANDLE_EXPIRED", node, ".handle",
+            f"{handle!r} is {now - saved['created_at']:.0f}s old, above max_age_seconds {age_limit:g}.",
+            "Re-read the data, or raise max_age_seconds if older data is acceptable.")
+        return
+    ni.checkpoint = saved
+    ni.labels = set(saved["labels"])
+    ni.trust = saved["trust"]
+
+
+def schema_of(value: Any) -> dict:
+    """A JSON Schema describing concrete saved data, so later plans get field checks on it."""
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    if isinstance(value, dict):
+        return {"type": "object", "properties": {k: schema_of(v) for k, v in value.items()}}
+    if isinstance(value, list):
+        props: dict[str, dict] = {}
+        scalar: dict | None = None
+        for item in value:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    props.setdefault(k, schema_of(v))
+            elif item is not None:
+                scalar = scalar or schema_of(item)
+        if props:
+            return {"type": "array", "items": {"type": "object", "properties": props}}
+        return {"type": "array", "items": scalar} if scalar else {"type": "array"}
+    return {}
+
+
 def _output_schema(ni: NodeInfo, schemas: dict[str, SchemaView], catalog: dict[str, UpstreamTool]) -> SchemaView:
     node = ni.node
+    if node.op == "checkpoint" and ni.checkpoint is not None:
+        return SchemaView(schema_of(ni.checkpoint["data"]))
     if node.op == "call" and ni.tool:
         return SchemaView(catalog[ni.tool].output_schema)
     if node.op == "map" and ni.tool:
