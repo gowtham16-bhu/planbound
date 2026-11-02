@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS journal (
     updated_at      REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS journal_plan ON journal(plan_id);
+CREATE INDEX IF NOT EXISTS journal_key ON journal(idem_key);
 CREATE TABLE IF NOT EXISTS approvals (
     plan_id      TEXT PRIMARY KEY,
     plan_hash    TEXT NOT NULL,
@@ -164,18 +165,15 @@ class Store:
             (status, json.dumps(result) if result is not None else None, error, time.time(), seq),
         )
 
+    def journal_find(self, idem_key: str) -> dict | None:
+        """The journal entry for one write (plan:node:item), if it was ever attempted."""
+        row = self.db.execute("SELECT * FROM journal WHERE idem_key = ? ORDER BY seq DESC LIMIT 1",
+                              (idem_key,)).fetchone()
+        return _journal_row(row) if row else None
+
     def journal(self, plan_id: str) -> list[dict]:
         rows = self.db.execute("SELECT * FROM journal WHERE plan_id = ? ORDER BY seq", (plan_id,))
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["args"] = json.loads(d.pop("args_json"))
-            res = d.pop("result_json")
-            d["result"] = json.loads(res) if res else None
-            comp = d.pop("compensator_json")
-            d["compensator"] = json.loads(comp) if comp else None
-            out.append(d)
-        return out
+        return [_journal_row(r) for r in rows]
 
     # ---------------------------------------------------------------- approvals
 
@@ -212,3 +210,13 @@ class Store:
 
     def used_tools(self) -> list[str]:
         return [r[0] for r in self.db.execute("SELECT tool FROM usage ORDER BY tool")]
+
+
+def _journal_row(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["args"] = json.loads(d.pop("args_json"))
+    res = d.pop("result_json")
+    d["result"] = json.loads(res) if res else None
+    comp = d.pop("compensator_json")
+    d["compensator"] = json.loads(comp) if comp else None
+    return d

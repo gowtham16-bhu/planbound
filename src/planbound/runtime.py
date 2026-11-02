@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from typing import Any, Protocol
 
 from .approval import verify_approval
 from .compiler import CompiledPlan, CompileError, compile_plan
-from .manifest import Manifest, ToolEffects, UpstreamTool, canonical, parse_io_path
+from .manifest import DEFAULT_CONFLICT_PATTERN, Manifest, ToolEffects, UpstreamTool, canonical, parse_io_path
 from .plan import PENDING, SKIPPED, Ctx, EvalError, Pending, Skipped, evaluate, get_path, resolve, split_path
 from .store import Store
 from .summary import summarize
@@ -23,7 +24,26 @@ SKIP_MARK = {"__planbound_skipped__": True}
 
 
 class UpstreamError(Exception):
-    pass
+    """An upstream call failed.
+
+    `definite=True`: the server answered with an error, so the effect did not happen.
+    `definite=False`: no answer (timeout, dropped connection). The effect may or may not have happened.
+    """
+
+    def __init__(self, message: str, *, definite: bool = True):
+        super().__init__(message)
+        self.definite = definite
+
+
+class OutcomeUnknown(UpstreamError):
+    """A write got no answer and could not safely be re-sent to find out what happened."""
+
+    def __init__(self, message: str):
+        super().__init__(message, definite=False)
+
+
+class WriteConflict(UpstreamError):
+    """A conditional write was refused because the data changed after the commit re-read."""
 
 
 class Upstreams(Protocol):
@@ -37,10 +57,11 @@ class QuarantineReader(Protocol):
 
 
 class NodeFailure(Exception):
-    def __init__(self, node_id: str, message: str):
+    def __init__(self, node_id: str, message: str, code: str | None = None):
         super().__init__(f"{node_id}: {message}")
         self.node_id = node_id
         self.message = message
+        self.code = code
 
 
 class SimulatedCrash(Exception):
@@ -72,6 +93,7 @@ class Runtime:
         display_dir: str | Path | None = None,
         retry_attempts: int = 3,
         retry_delay_s: float = 0.2,
+        compensation_attempts: int = 5,
     ):
         self.store = store
         self.upstreams = upstreams
@@ -81,6 +103,7 @@ class Runtime:
         self.display_dir = Path(display_dir) if display_dir else Path(".planbound/display")
         self.retry_attempts = retry_attempts
         self.retry_delay_s = retry_delay_s
+        self.compensation_attempts = compensation_attempts
         self.crash_after_writes: int | None = None
         self._crashed = False
         self._writes_done = 0
@@ -157,11 +180,39 @@ class Runtime:
         return await self._commit(plan_id, compiled, preview["preview_hash"])
 
     async def recover(self) -> list[dict]:
-        """Finish plans a crashed gateway left running: compensate before the pivot, roll forward after."""
+        """Reconcile every plan that did not end cleanly.
+
+        `running` (the gateway crashed), `failed_partial` (an undo step failed, or retry-safe steps after
+        the point of no return are unfinished) and `needs_attention` (a write's outcome is unknown, until
+        a human resolves it). Before the point of no return: compensate. After it: roll forward.
+        Safe to run again and again; finished steps are never repeated.
+        """
         reports = []
-        for plan_id in self.store.plans_with_status("running"):
+        for plan_id in self.store.plans_with_status("running", "failed_partial", "needs_attention"):
             reports.append(await self._recover_one(plan_id))
         return reports
+
+    def resolve(self, plan_id: str, step: str, happened: bool, result: Any = None) -> dict:
+        """A human settles a write whose outcome was unknown: `step` is `node[index]`, as reported."""
+        m = re.fullmatch(r"([a-z][a-z0-9_]*)\[(\d+)\]", step)
+        if not m:
+            return {"status": "error", "message": "step must look like node[index], e.g. refunds[3]"}
+        entry = next((e for e in self.store.journal(plan_id)
+                      if e["node_id"] == m.group(1) and e["item_index"] == int(m.group(2))), None)
+        if entry is None or entry["status"] != "UNKNOWN":
+            return {"status": "error",
+                    "message": f"{step} is not an unknown write ({entry['status'] if entry else 'no such step'})"}
+        needs_output = entry["state"] == "compensatable" and "$output" in json.dumps(entry["compensator"] or {})
+        if happened and result is None and needs_output:
+            return {"status": "error",
+                    "message": f"{step} is undone from the tool's result; pass it (e.g. --result "
+                               "'{\"refund_id\": \"RF-00042\"}') so the plan can be rolled back"}
+        if happened:
+            self.store.journal_set(entry["seq"], "COMPLETED", result=result)
+        else:
+            self.store.journal_set(entry["seq"], "FAILED", error="a human confirmed it did not happen")
+        return {"status": "resolved", "plan_id": plan_id, "step": step, "happened": happened,
+                "next": "Run `planbound recover` to finish or roll back the plan."}
 
     def inspect(self, handle: str, path: str = "", where: dict | None = None, group_by: str | None = None) -> dict:
         if not handle.startswith("h://") or handle.count("/") != 3:
@@ -379,16 +430,50 @@ class Runtime:
                 break
         if failure is None:
             result = self._result(run, "completed")
-        elif not run.pivot_done:
-            comp = await self._compensate(run.plan_id)
-            status = "failed_compensated" if comp["ok"] else "failed_partial"
-            result = self._result(run, status, failure=failure, compensation=comp)
         else:
-            result = self._result(run, "failed_partial", failure=failure,
-                                  note="The point of no return had passed. Remaining retry-safe steps can be "
-                                       "finished with `planbound recover`.")
+            result = await self._settle(run.plan_id, run=run, failure=failure)
         self.store.update_plan(run.plan_id, status=result["status"], result=result)
         return result
+
+    async def _settle(self, plan_id: str, *, run: Run | None = None, failure: NodeFailure | None = None) -> dict:
+        """Decide what a plan that stopped early needs, from the journal alone, and do what is safe."""
+        journal = self.store.journal(plan_id)
+        unknown = [_step(e) for e in journal if e["status"] == "UNKNOWN"]
+        # Past the point of no return once something that cannot be undone has happened: the pivot, or a
+        # retry-safe step (those are not undone, so the plan can only go forward).
+        passed = any(e["state"] in ("irreversible", "idempotent_write") and e["status"] == "COMPLETED"
+                     for e in journal)
+        pivot_unknown = any(e["state"] == "irreversible" and e["status"] == "UNKNOWN" for e in journal)
+
+        def out(status: str, **kw) -> dict:
+            if run is not None:
+                return self._result(run, status, failure=failure, **kw)
+            return {"status": status, "plan_id": plan_id, **{k: v for k, v in kw.items() if v is not None}}
+
+        if pivot_unknown:
+            return out("needs_attention", unknown=unknown,
+                       note="The point of no return may or may not have happened, so nothing was compensated. "
+                            "Check each unknown step upstream, record it with `planbound resolve`, then run "
+                            "`planbound recover`.")
+        if not passed:
+            comp = await self._compensate(plan_id)
+            if unknown:
+                return out("needs_attention", compensation=comp, unknown=unknown,
+                           note="Undoable steps that are known to have happened were compensated. The unknown "
+                                "steps may still have happened: check each upstream, record it with "
+                                "`planbound resolve`, then run `planbound recover`.")
+            if run is None:
+                return out("recovered_compensated" if comp["ok"] else "failed_partial", compensation=comp)
+            return out("failed_compensated" if comp["ok"] else "failed_partial", compensation=comp,
+                       note=None if comp["ok"] else "Some undo steps failed even after retries. "
+                                                    "`planbound recover` retries them.")
+        if unknown:
+            return out("needs_attention", unknown=unknown,
+                       note="Past the point of no return, with steps whose outcome is unknown. Check each "
+                            "upstream, record it with `planbound resolve`, then run `planbound recover`.")
+        return out("failed_partial",
+                   note="The point of no return had passed. Remaining retry-safe steps can be finished "
+                        "with `planbound recover`.")
 
     async def _run_node(self, run: Run, nid: str, real: bool = True) -> None:
         c = run.compiled
@@ -436,6 +521,10 @@ class Runtime:
         except Pending:
             run.outputs[nid] = PENDING
             return
+        except WriteConflict as e:
+            raise NodeFailure(nid, str(e), code="E_WRITE_CONFLICT") from e
+        except OutcomeUnknown as e:
+            raise NodeFailure(nid, str(e), code="E_OUTCOME_UNKNOWN") from e
         except (EvalError, UpstreamError) as e:
             raise NodeFailure(nid, str(e)) from e
         run.outputs[nid] = value
@@ -451,20 +540,48 @@ class Runtime:
         if ni.kind != "write":
             return await self.upstreams.call(ni.tool, args)
         key = f"{run.plan_id}:{ni.node.id}:{idx}"
+        prior = self.store.journal_find(key)
+        if prior is not None:
+            if prior["status"] == "COMPLETED":
+                return prior["result"]  # rolling forward: this write already happened, never repeat it
+            if prior["status"] != "FAILED":
+                raise UpstreamError(f"{ni.tool} is {prior['status']} in the journal; refusing to repeat it")
+            seq = prior["seq"]  # it definitely did not happen: try again on the same journal entry
+            self.store.journal_set(seq, "IN_FLIGHT")
+        else:
+            seq = self.store.journal_begin(run.plan_id, ni.node.id, idx, ni.tool, eff.state, args, key,
+                                           eff.compensator)
         meta = {IDEM_META: key} if eff.idempotency_keys else None
-        seq = self.store.journal_begin(run.plan_id, ni.node.id, idx, ni.tool, eff.state, args, key, eff.compensator)
-        attempts = self.retry_attempts if eff.state == "idempotent_write" else 1
-        last: Exception | None = None
-        for attempt in range(attempts):
+        # Re-sending is safe when the write is idempotent by nature, or the server deduplicates on the key.
+        resend_safe = eff.state == "idempotent_write" or eff.idempotency_keys
+        conflict = re.compile(eff.conditional.get("conflict_pattern", DEFAULT_CONFLICT_PATTERN)) \
+            if eff.conditional else None
+        last: UpstreamError | None = None
+        result: Any = None
+        ok = False
+        for attempt in range(self.retry_attempts):
             try:
                 result = await self.upstreams.call(ni.tool, args, meta)
+                ok = True
                 break
             except UpstreamError as e:
                 last = e
-                if attempt + 1 < attempts:
+                if e.definite and conflict and conflict.search(str(e)):
+                    break  # the data changed: retrying cannot help
+                # A definite error is retried only for idempotent writes; a lost answer whenever re-sending
+                # cannot repeat the effect.
+                if not (eff.state == "idempotent_write" or (not e.definite and resend_safe)):
+                    break
+                if attempt + 1 < self.retry_attempts:
                     await asyncio.sleep(self.retry_delay_s * (attempt + 1))
-        else:
+        if not ok:
+            assert last is not None
+            if not last.definite:
+                self.store.journal_set(seq, "UNKNOWN", error=str(last))
+                raise OutcomeUnknown(f"{ni.tool} got no answer, so it may or may not have happened: {last}")
             self.store.journal_set(seq, "FAILED", error=str(last))
+            if conflict and conflict.search(str(last)):
+                raise WriteConflict(f"{ni.tool} refused: the data changed after the commit re-read ({last})")
             raise UpstreamError(f"{ni.tool} failed: {last}")
         self._writes_done += 1
         if self._crashed or (self.crash_after_writes is not None and self._writes_done >= self.crash_after_writes):
@@ -474,17 +591,35 @@ class Runtime:
         return result
 
     async def _compensate(self, plan_id: str) -> dict:
+        """Undo completed compensatable writes, newest first. Each undo is retried; failures are recorded
+        (COMPENSATION_FAILED) and retried again by the next `recover`."""
         done, failed = [], []
-        entries = [e for e in self.store.journal(plan_id) if e["state"] == "compensatable" and e["status"] == "COMPLETED"]
+        entries = [e for e in self.store.journal(plan_id)
+                   if e["state"] == "compensatable" and e["status"] in ("COMPLETED", "COMPENSATION_FAILED")]
         for e in reversed(entries):
-            try:
-                tool, args = _compensator_call(e)
-                await self.upstreams.call(tool, args, {IDEM_META: e["idem_key"] + ":compensate"})
+            error: str | None = None
+            for attempt in range(self.compensation_attempts):
+                try:
+                    tool, args = _compensator_call(e)
+                except Exception as ex:  # noqa: BLE001 - e.g. no recorded result to undo from: not retryable
+                    error = f"cannot build the undo call: {ex}"
+                    break
+                try:
+                    await self.upstreams.call(tool, args, {IDEM_META: e["idem_key"] + ":compensate"})
+                    error = None
+                    break
+                except SimulatedCrash:
+                    raise
+                except Exception as ex:  # noqa: BLE001 - every failure must be recorded, never raised mid-rollback
+                    error = str(ex)
+                    if attempt + 1 < self.compensation_attempts:
+                        await asyncio.sleep(self.retry_delay_s * 2 ** attempt)
+            if error is None:
                 self.store.journal_set(e["seq"], "COMPENSATED")
-                done.append(f"{e['node_id']}[{e['item_index']}]")
-            except Exception as ex:  # noqa: BLE001 - every failure must be recorded, never raised mid-rollback
-                self.store.journal_set(e["seq"], "COMPENSATION_FAILED", error=str(ex))
-                failed.append({"step": f"{e['node_id']}[{e['item_index']}]", "error": str(ex)})
+                done.append(_step(e))
+            else:
+                self.store.journal_set(e["seq"], "COMPENSATION_FAILED", error=error)
+                failed.append({"step": _step(e), "error": error})
         return {"ok": not failed, "compensated": len(done), "failed": failed}
 
     # ================================================================ recovery
@@ -495,35 +630,35 @@ class Runtime:
         for e in self.store.journal(plan_id):
             if e["status"] != "IN_FLIGHT":
                 continue
+            # A crash during the call: re-send to learn the outcome, but only where that cannot repeat it.
             eff = compiled.info[e["node_id"]].effects
-            if e["state"] in ("compensatable", "idempotent_write") and eff.idempotency_keys:
+            if e["state"] == "idempotent_write" or eff.idempotency_keys:
                 try:
-                    result = await self.upstreams.call(e["tool"], e["args"], {IDEM_META: e["idem_key"]})
+                    result = await self.upstreams.call(e["tool"], e["args"],
+                                                       {IDEM_META: e["idem_key"]} if eff.idempotency_keys else None)
                     self.store.journal_set(e["seq"], "COMPLETED", result=result)
                 except UpstreamError as ex:
-                    self.store.journal_set(e["seq"], "FAILED", error=str(ex))
+                    self.store.journal_set(e["seq"], "FAILED" if ex.definite else "UNKNOWN", error=str(ex))
             else:
                 self.store.journal_set(e["seq"], "UNKNOWN", error="crashed during the call; outcome unknown")
-        journal = self.store.journal(plan_id)
-        if any(e["state"] == "irreversible" and e["status"] == "UNKNOWN" for e in journal):
-            result = {"status": "needs_attention", "plan_id": plan_id,
-                      "message": "The gateway crashed during the irreversible step, so it may or may not have "
-                                 "happened. Check it manually; nothing was compensated."}
-        elif not any(e["state"] == "irreversible" and e["status"] == "COMPLETED" for e in journal):
-            comp = await self._compensate(plan_id)
-            result = {"status": "recovered_compensated" if comp["ok"] else "failed_partial", "plan_id": plan_id,
-                      "compensation": comp}
-        else:
+        result = await self._settle(plan_id)
+        if result["status"] == "failed_partial" and "compensation" not in result:
+            # Past the point of no return with nothing unknown: roll forward.
             run = Run(plan_id, compiled, rec["caller"], pivot_done=True)
             for nid, data in self.store.handles_for(plan_id).items():
                 run.outputs[nid] = SKIPPED if data == SKIP_MARK else data
             remaining = [n for n in compiled.order if n not in run.outputs]
-            result = await self._execute(run, remaining)
-            result["recovered"] = True
+            done = {e["node_id"] for e in self.store.journal(plan_id) if e["status"] == "COMPLETED"}
+            blocked = [n for n in remaining if compiled.info[n].state == "irreversible" and n not in done]
+            if blocked:
+                result = {"status": "needs_attention", "plan_id": plan_id,
+                          "note": f"Rolling forward would run irreversible step(s) {', '.join(blocked)} long after "
+                                  "approval. Submit them as a new plan instead."}
+            else:
+                result = await self._execute(run, remaining)
+        result["recovered"] = True
         self.store.update_plan(plan_id, status=result["status"], result=result)
         return result
-
-    # ================================================================ helpers
 
     async def _quarantine(self, ni, items: Any) -> list:
         node = ni.node
@@ -565,7 +700,8 @@ class Runtime:
         }
 
     def _result(self, run: Run, status: str, *, failure: NodeFailure | None = None,
-                compensation: dict | None = None, note: str | None = None) -> dict:
+                compensation: dict | None = None, note: str | None = None,
+                unknown: list[str] | None = None) -> dict:
         c = run.compiled
         wanted = c.plan.returns or [n for n in c.order if not any(n in c.deps[m] for m in c.order)]
         journal = self.store.journal(run.plan_id)
@@ -581,6 +717,10 @@ class Runtime:
         }
         if failure:
             out["failure"] = {"node_id": failure.node_id, "message": failure.message}
+            if failure.code:
+                out["failure"]["code"] = failure.code
+        if unknown:
+            out["unknown"] = unknown
         if compensation:
             out["compensation"] = compensation
         if note:
@@ -604,6 +744,10 @@ def _waves_of(nodes: list[str], deps: dict[str, set[str]], done: set[str]) -> li
         finished |= set(wave)
         remaining = [n for n in remaining if n not in finished]
     return waves
+
+
+def _step(entry: dict) -> str:
+    return f"{entry['node_id']}[{entry['item_index']}]"
 
 
 def _compensator_call(entry: dict) -> tuple[str, dict]:

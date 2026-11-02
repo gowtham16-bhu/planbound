@@ -16,7 +16,8 @@ class Env:
     def runtime(self, manifest, caller=None, **kw) -> Runtime:
         kw.setdefault("display_dir", self.tmp / "display")
         kw.setdefault("retry_delay_s", 0.0)
-        return Runtime(self.store, self.up, manifest, caller or {"user": "ops"}, **kw)
+        upstreams = kw.pop("upstreams", self.up)
+        return Runtime(self.store, upstreams, manifest, caller or {"user": "ops"}, **kw)
 
 
 @pytest.fixture

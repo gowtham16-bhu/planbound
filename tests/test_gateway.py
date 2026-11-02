@@ -22,7 +22,7 @@ async def test_agent_uses_planbound_over_plain_mcp(tmp_path):
                          "planbound_inspect_handle"}
         index = (await agent.call_tool("planbound_search_tools", {})).structured_content
         sigs = [t["signature"] for t in index["tools"]]
-        assert any(s.startswith("billing.refund_order(order_id, amount, reason?)") for s in sigs)
+        assert any(s.startswith("billing.refund_order(order_id, amount, reason?, expected_version?)") for s in sigs)
         assert not any("update_customer_tier" in s for s in sigs)  # unlisted tools are hidden
         res = await agent.call_tool("planbound_submit_plan", {"plan": refund_plan()})
         body = res.structured_content

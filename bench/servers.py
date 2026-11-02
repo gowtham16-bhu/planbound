@@ -53,6 +53,7 @@ class Order(BaseModel):
     created_at: str
     sku: str
     note: str
+    version: int = 1
 
 
 class OrderList(BaseModel):
@@ -245,8 +246,10 @@ def build_servers(w: World) -> dict[str, MCPServer]:
                                      for i in ids])
 
     @billing.tool()
-    async def refund_order(order_id: str, amount: float, ctx: Context, reason: str = "overdue_writeoff") -> Refund:
-        """Issue a refund for an order. The amount must not exceed the order amount."""
+    async def refund_order(order_id: str, amount: float, ctx: Context, reason: str = "overdue_writeoff",
+                           expected_version: int | None = None) -> Refund:
+        """Issue a refund for an order. The amount must not exceed the order amount.
+        Pass expected_version to refuse the refund if the order changed since you read it."""
         await delay("billing.refund_order")
 
         def do() -> Refund:
@@ -255,6 +258,9 @@ def build_servers(w: World) -> dict[str, MCPServer]:
             order = w.orders.get(order_id)
             if order is None:
                 raise ToolError(f"unknown order {order_id}")
+            if expected_version is not None and order.version != expected_version:
+                raise ToolError(f"version conflict: order {order_id} is at version {order.version}, "
+                                f"not {expected_version}")
             if order.status == "refunded":
                 raise ToolError(f"order {order_id} is already refunded")
             if amount > order.amount:
@@ -263,6 +269,7 @@ def build_servers(w: World) -> dict[str, MCPServer]:
             w.refunds[rid] = Refund(refund_id=rid, order_id=order_id, amount=amount, status="issued")
             w._prev_status[order_id] = order.status
             order.status = "refunded"
+            order.version += 1
             return w.refunds[rid]
 
         return once(ctx, do)
@@ -277,6 +284,7 @@ def build_servers(w: World) -> dict[str, MCPServer]:
             if r.status != "cancelled":
                 r.status = "cancelled"
                 w.orders[r.order_id].status = w._prev_status.pop(r.order_id, "overdue")
+                w.orders[r.order_id].version += 1
             return r
 
         return once(ctx, do)
