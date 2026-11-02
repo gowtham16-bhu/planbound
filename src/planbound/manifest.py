@@ -68,6 +68,9 @@ class ToolEffects:
     # value in `arg` (a version, etag, expected balance...) no longer matches. Closes the race between
     # the commit re-read and the write.
     conditional: dict | None = None
+    # The operator confirms the upstream checks io.planbound/fencing-token: it refuses a write whose
+    # lease epoch is lower than one it already saw for that plan. Closes the stalled-gateway gap.
+    fencing: bool = False
     confirm_read_only: bool = False
     inferred: bool = False
 
@@ -100,6 +103,8 @@ class ToolEffects:
             out["requires_approval"] = True
         if self.idempotency_keys:
             out["idempotency_keys"] = True
+        if self.fencing:
+            out["fencing"] = True
         if self.confirm_read_only:
             out["confirm_read_only"] = True
         return out
@@ -160,6 +165,7 @@ class Manifest:
                 requires_approval=bool(raw.get("requires_approval", False)),
                 idempotency_keys=bool(raw.get("idempotency_keys", False)),
                 conditional=conditional,
+                fencing=bool(raw.get("fencing", False)),
                 confirm_read_only=bool(raw.get("confirm_read_only", False)),
             )
         for name, eff in tools.items():

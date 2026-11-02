@@ -39,6 +39,9 @@ Agent ──plan──► Planbound: Check ─► Preview ─► Approve ─► 
 | A write gets no answer | Re-sent with the same key only if that can't repeat it; otherwise `needs_attention` and `planbound resolve`, never a guess |
 | Data changes between the re-read and the write | `conditional` writes pass the version read earlier; the server refuses → `E_WRITE_CONFLICT`, rolled back |
 | `recover` racing a live gateway, or two commits of one plan | Plan leases: one driver at a time; recover only takes plans whose lease expired |
+| A stalled gateway waking up after recovery took over | Fencing tokens: the journal and fencing-aware upstreams refuse the old holder |
+| An undo service down for hours | Background reconciliation (`reconcile_seconds`) finishes the rollback when it is back |
+| Investigations that decide what to look at next | Multi-stage plans: each stage continues from earlier results with `checkpoint` |
 | Money moving without upstream guarantees | `strict_writes`: sensitive tools must declare idempotency keys and a conditional write |
 
 ## Benchmark (real MCP calls, simulated model)
@@ -49,7 +52,7 @@ Direct calling gets every advantage (parallel tool calls, server-side status fil
 | | Direct MCP | Code mode | Planbound |
 |---|---|---|---|
 | LLM turns | 4 | 2 | **2** |
-| Tokens the model reads | 8,213 | 1,497 | 3,223 |
+| Tokens the model reads | 8,213 | 1,497 | 3,510 |
 | Tokens the model writes | 136 | 179 | 348 |
 | Untrusted text in the model's context (injected note) | 227 tok, **incl. injection** | 0 (this script didn't print it) | **0 (by construction)** |
 | One refund fails mid-batch | **1 refund left done** | **1 refund left done** | **nothing changed** |
@@ -65,7 +68,8 @@ simulated; run against a real model before quoting latency.
 
 ```bash
 uv sync --all-groups
-uv run pytest -q                     # 71 tests, incl. fault injection
+uv run pytest -q                     # 85 tests, incl. fault injection
+uv run --extra reader python -m bench.live   # real model + live reader check (needs API credentials)
 uv run python -m bench.run           # writes bench/RESULTS.md
 uv run python -m bench.demo_setup    # writes demo/: config, pinned manifest, signing keys
 ```
@@ -119,10 +123,13 @@ Built and tested: compiler and diagnostics, effects manifest (state × egress, l
 identity, hash pinning, dev-mode inference and drafting), preview and stale check, three approval
 tiers with Ed25519 and a budget ledger with holds, saga executor with compensation, retries and
 crash recovery and reconciliation (fault-injection tests for failing undo steps, crashes during
-rollback, lost answers and concurrent writers), conditional writes, handles and deterministic summaries, display sink, MCP gateway and CLI.
+rollback, lost answers and concurrent writers), conditional writes, plan leases and fencing tokens,
+background reconciliation, multi-stage plans (`checkpoint`), handles and deterministic summaries,
+display sink, MCP gateway and CLI.
 
-Not yet verified: the Claude-backed quarantined reader (`planbound.reader.AnthropicReader`) has not
-been run against the live API here; tests use a deterministic reader. `checkpoint` is reserved for v0.2.
+Real-model benchmark: `bench/live.py` runs the task with a real Claude model, directly over MCP and
+through Planbound, and checks the Claude-backed quarantined reader against the live API. Its loop is
+tested offline; its numbers need your API credentials (results go to `bench/LIVE_RESULTS.md`).
 
 Read [SPEC.md](SPEC.md) for the full design and its limits.
 

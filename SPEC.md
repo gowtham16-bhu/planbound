@@ -68,11 +68,12 @@ Owned by the operator. Server annotations are hints; only this file is trusted (
 | `idempotency_keys` | The operator confirms the upstream honours `io.planbound/idempotency-key` (default **false**). Without it a write that gets no answer is never re-sent; it becomes `UNKNOWN` |
 | `conditional` | `{"arg": "expected_version", "conflict_pattern"?: "<regex>"}`: the upstream refuses the write if `arg` no longer matches. The plan must fill `arg` from a read (`$ref`/`$item`), else `E_CONDITIONAL_REQUIRED`; a refusal matching the pattern fails the step with `E_WRITE_CONFLICT` and the plan rolls back |
 | `compensator` | The undo call. Its tool must be listed and be `idempotent_write` or declare `idempotency_keys: true`, because rollback retries it; otherwise the manifest does not load |
+| `fencing` | The operator confirms the upstream checks `io.planbound/fencing-token` (`{"plan", "epoch"}`): it remembers the highest epoch seen per plan and refuses lower ones with an error containing `io.planbound/fencing-token rejected` |
 | `confirm_read_only` | Needed to mark a tool `read_only` when its name says it writes (`refund_`, `send_`, `delete_`, …); otherwise the manifest does not load |
 
 **`defaults.strict_writes`.** When true, every *sensitive* write (one with a `cost` or
-`requires_approval`) must declare both `idempotency_keys: true` and `conditional`, or the plan fails
-with `E_UNSAFE_WRITE`. Turn it on for anything that moves money.
+`requires_approval`) must declare `idempotency_keys: true`, `conditional` and `fencing: true`, or the
+plan fails with `E_UNSAFE_WRITE`. Turn it on for anything that moves money.
 
 **Hint conflicts.** A tool the manifest calls `read_only` but the server annotates `destructiveHint`
 is refused with `E_EFFECTS_CONFLICT`.
@@ -99,13 +100,23 @@ anything else → `irreversible`), results are marked unverified, and tool usage
 | `map` | `input` (list), `max_items` (**required**), `call: {tool, args}`, `concurrency?` (default 8) | list of results |
 | `quarantine_read` | `input`, `field`, `max_items`, `schema` of closed types | items plus the extracted fields |
 | `display` | `input` | data is written for the human; the model sees only a receipt |
-| `checkpoint` | reserved for v0.2 | — |
+| `checkpoint` | `handle` (`h://plan/node` from an earlier plan's summary), `max_age_seconds`? | that saved result, as if read again: same labels and trust, field checks against its data |
 
 **Values:** literals, `{"$ref": "node.a.b"}`, `{"$item": "field"}` (map args, `where`),
 `{"$agg": {"fn": "count|distinct_count|sum|min|max|mean", "of": "node.path", "field": "f", "default": d}}`,
 `{"$caller": "attr"}`.
 **Conditions:** `eq ne gt gte lt lte` (`[a, b]`), `in` (`[a, list]`), `and`, `or`, `not`, `exists`.
 No loops, functions or string operations, so every plan terminates and can be analysed before it runs.
+
+**Multi-stage work** (an investigation that decides what to look at next): send a read-only plan,
+read its summaries, then send the next plan, which starts from earlier results with `checkpoint`
+nodes instead of reading them again. Chains have no length limit; each stage is still a bounded,
+checked plan. A checkpoint must belong to the same caller (`E_HANDLE_CALLER`), exist
+(`E_UNKNOWN_HANDLE`), come from a plan that completed or never wrote anything (`E_HANDLE_UNUSABLE`:
+results of rolled-back or partial plans describe writes that did not stick), and be younger than
+`max_age_seconds` if the plan sets one (`E_HANDLE_EXPIRED`, checked again at commit). Saved data can
+go stale like any read: pair it with `conditional` writes. Budgets across stages are the policy
+signer's rolling budget.
 
 ---
 
@@ -119,7 +130,8 @@ All errors come back together with `code`, `node_id`, JSON `path`, `message` and
 `E_BAD_AGG` `E_MISSING_MAP_BOUND` `E_QUARANTINE_SCHEMA` `E_QUARANTINE_READER_UNCONFIGURED`
 `E_IDENTITY` `E_LABEL_FLOW` `E_WHEN_ON_WRITE` `E_MULTIPLE_PIVOTS` `E_IRREVERSIBLE_NOT_TERMINAL`
 `E_SAGA_ORDER` `E_COST_BOUND` (suggests a smaller `max_items`) `E_CONDITIONAL_REQUIRED`
-`E_UNSAFE_WRITE` `E_EFFECTS_CONFLICT`.
+`E_UNSAFE_WRITE` `E_EFFECTS_CONFLICT` `E_UNKNOWN_HANDLE` `E_HANDLE_CALLER` `E_HANDLE_UNUSABLE`
+`E_HANDLE_EXPIRED`.
 
 **Saga shape** (enforced here, not hoped for at runtime):
 `compensatable steps → at most one irreversible pivot → idempotent_write steps`.
@@ -178,11 +190,20 @@ is rejected; a second irreversible step needs `allow_partial_irreversible`.
    renews a lease (`runtime.lease_seconds` in the gateway config, default 60s) before every write and every undo step. `recover`
    only takes plans whose lease has expired, so it never compensates a plan a live gateway is still
    running; a gateway that finds its lease taken stops at once (`LeaseLost`).
+   **Fencing.** Each new holder bumps the plan's lease epoch. Every write and undo call carries
+   `io.planbound/fencing-token` = `{"plan", "epoch"}`, and every journal write is conditional on
+   holding the lease. So a gateway that stalls *between* renewing and sending cannot do harm: the
+   journal refuses its updates, and an upstream with `fencing` refuses its late write once the new
+   holder has called it (recovery's own re-sends and undo calls do that first).
+9. **Background reconciliation.** `runtime.reconcile_seconds` makes the gateway run `recover` on a
+   timer with its own lease identity, so it never takes over a plan the gateway is running. A rollback
+   stuck on a down service finishes by itself once the service is back. `planbound recover --watch`
+   does the same from the command line.
 
 **Gateway config `runtime` section** (optional; used by `serve`, `recover`, `resolve`, `abandon`):
 
 ```json
-"runtime": {"lease_seconds": 60, "retry_attempts": 3, "compensation_attempts": 5}
+"runtime": {"lease_seconds": 60, "retry_attempts": 3, "compensation_attempts": 5, "reconcile_seconds": 30}
 ```
 
 | Option | Default | Meaning |
@@ -190,6 +211,7 @@ is rejected; a second irreversible step needs `allow_partial_irreversible`.
 | `lease_seconds` | 60 (1–86400) | Lease length. Longer than your slowest upstream write; shorter than you will wait for `recover` to take over a dead gateway |
 | `retry_attempts` | 3 (1–20) | Attempts per write: definite errors for `idempotent_write`, lost answers where re-sending is safe |
 | `compensation_attempts` | 5 (1–50) | Attempts per undo step during one rollback, with exponential backoff |
+| `reconcile_seconds` | 0 = off (0–86400) | Run `recover` in the background this often |
 
 Unknown options and out-of-range values stop the gateway from starting.
 
@@ -205,22 +227,28 @@ views under the same rules. Trusted sources and `display` receipts are the only 
 
 ---
 
-## 6. Honest limits
+## 6. Limits that remain
 
-- **Saga semantics, not ACID.** Others can see a refund before it is compensated; an email cannot be unsent.
-- **Classification can be steered.** A quarantined reader can only return closed types, so injected
-  text cannot add actions, but a crafted text can still pick a wrong category. Bounds and budgets stay.
-- **Upstream support matters.** Without idempotency keys or conditional writes, a small race window
-  remains between the commit re-read and the write, and a lost answer needs a human. Planbound can
-  require them (`strict_writes`) but cannot make a server honour what it claims to.
-- **Rollback can still be stuck.** Undo steps are retried and reconciled, but if a compensator keeps
-  failing the plan stays `failed_partial` until the upstream recovers or a human steps in.
-- **Leases are not fencing.** A gateway that stalls longer than `lease_seconds` *between* renewing and
-  sending a write can still send it after recovery took over. Recovery then sees the write as in
-  flight and handles it like a crash. Closing that gap needs upstreams that check a fencing token.
-- **The manifest is trusted.** The load-time and hint checks catch obvious mislabels, not a
-  write tool with a read-like name and no annotations.
+Each of these is a property of the problem, not a missing feature. They are stated so nobody relies
+on a guarantee Planbound cannot give.
+
+- **Saga semantics, not ACID.** Independent systems have no shared transaction, so others can see a
+  refund before it is compensated, and an email cannot be unsent. Planbound orders the steps so at
+  most one irreversible step exists and it runs last.
+- **Upstream guarantees are claims.** Idempotency keys, conditional writes and fencing tokens only
+  help if the server really honours them. `strict_writes` makes Planbound refuse sensitive tools whose
+  operator has not confirmed them; it cannot audit the server.
+- **A rollback waits for the service it needs.** Undo steps are retried, and with
+  `reconcile_seconds` they are retried forever in the background, so a rollback finishes as soon as
+  the service is back. Until then the plan is honestly `failed_partial`.
+- **A lost answer without idempotency keys needs a person.** Nothing can tell whether such a write
+  happened except the upstream itself; Planbound reports it (`needs_attention`) and never guesses.
+- **Classification can be steered.** A quarantined reader returns only closed types, so injected text
+  cannot add actions, but a crafted text can still pick a wrong category. Bounds and budgets stay.
+- **The manifest is trusted.** Load-time and hint checks catch obvious mislabels, not a write tool
+  with a read-like name and no annotations.
 - **Approval channel.** The gateway only holds public keys, but the policy signer and the human
   must run where the agent cannot reach their private keys.
-- **Identity comes from the host.** v0.1 reads the caller from config or `PLANBOUND_CALLER`.
-- **Plans cost more output tokens than a code-mode script** (see `bench/RESULTS.md`).
+- **Identity comes from the host.** The caller comes from config or `PLANBOUND_CALLER`.
+- **Plans cost more output tokens than a code-mode script** (see `bench/RESULTS.md`); the safety
+  checks are paid for in a JSON plan instead of a short script.

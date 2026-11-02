@@ -2,8 +2,13 @@ import json
 
 import pytest
 
-from bench.scenarios import address_plan, hr_manifest, offboarding_plan, refund_manifest, refund_plan
-from bench.servers import INJECTION
+from bench.scenarios import (
+    address_plan,
+    hr_manifest,
+    offboarding_plan,
+    refund_manifest,
+    refund_plan,
+)
 from planbound.reader import RuleReader
 from planbound.runtime import Runtime, SimulatedCrash
 
@@ -195,7 +200,7 @@ async def test_display_sink_keeps_text_away_from_model(injected_env):
         {"id": "show", "op": "display", "input": {"$ref": "orders.orders"}}]})
     path = res["summaries"]["show"]["summary"]["displayed_to"]
     assert "IGNORE" not in json.dumps(res)
-    assert "IGNORE" in open(env.tmp / "display" / path.split("/")[-1]).read()
+    assert "IGNORE" in (env.tmp / "display" / path.split("/")[-1]).read_text()
 
 
 async def test_compile_error_returns_all_diagnostics(env):

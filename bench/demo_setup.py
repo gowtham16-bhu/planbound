@@ -29,7 +29,7 @@ async def main(out: Path) -> None:
     (out / "planbound.config.json").write_text(json.dumps({
         "servers": servers, "manifest": "planbound.effects.json", "data_dir": ".planbound",
         "caller": {"user": "ops-demo", "roles": ["ops"]},
-        "runtime": {"lease_seconds": 60, "retry_attempts": 3, "compensation_attempts": 5},
+        "runtime": {"lease_seconds": 60, "retry_attempts": 3, "compensation_attempts": 5, "reconcile_seconds": 30},
     }, indent=2))
     print(f"Demo written to {out}/")
 

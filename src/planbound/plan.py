@@ -264,7 +264,7 @@ def dependencies(node: Node) -> set[str]:
 def parse_plan(data: Any) -> Plan:
     """Shape-only parse. Semantic checks live in the compiler."""
     if not isinstance(data, dict):
-        raise ValueError("plan must be a JSON object")
+        raise ValueError("plan must be a JSON object")  # noqa: TRY004 - callers catch ValueError for bad plans
     nodes: dict[str, Node] = {}
     for i, raw in enumerate(data.get("nodes", []) or []):
         if not isinstance(raw, dict):
